@@ -4,8 +4,8 @@ import streamlit as st
 import plotly.graph_objects as go
 
 st.set_page_config(page_title='Geotecnia Mina Web',layout='wide')
-st.title('Geotecnia Mina · visor geotécnico 3D')
-st.warning('Versión exploratoria: calcula líneas de intersección entre planos, pero NO identifica cuñas cerradas ni calcula su factor de seguridad o sostenimiento. No usar para diseño.')
+st.title('Geotecnia Mina · secciones 2D y visor 3D · v4')
+st.warning('VERSIÓN 4 · La vista 2D representa el sostenimiento y la 3D muestra planos e intersecciones ilustrativas. NO se calculan cuñas cerradas ni FS 3D. El FS inferior corresponde solo a un bloque hipotético definido manualmente. NO usar para dimensionamiento.')
 
 with st.sidebar:
     st.header('Galería')
@@ -113,9 +113,16 @@ if uploaded is not None:
         st.success(f'DXF importado: {n} entidades geométricas representadas. Comprueba escala, origen y unidades.')
     except Exception as exc:
         st.error(f'No se pudo leer el DXF: {exc}. Exporta como DXF ASCII desde AutoCAD.')
-fig.update_layout(height=620,scene=dict(aspectmode='data',xaxis_title='X (m)',yaxis_title='Y (m)',zaxis_title='Z (m)'),margin=dict(l=0,r=0,b=0,t=10))
-fig.update_layout(scene_camera=dict(eye=dict(x=1.65,y=1.8,z=1.15)),scene=dict(aspectmode='data',xaxis_title='X (m)',yaxis_title='Y (m)',zaxis_title='Z (m)'),height=750)
-st.plotly_chart(fig,use_container_width=True)
+# Escala y cámara: aproximar el objeto en vez de encuadrar los extremos
+# de líneas de intersección de planos infinitos.
+fig.update_layout(
+    height=680, margin=dict(l=0,r=0,b=0,t=0),
+    scene=dict(aspectmode='manual',aspectratio=dict(x=1,y=max(1.0,length/width*.7),z=1),
+        xaxis=dict(title='X (m)',range=[-width*1.1,width*1.1]),
+        yaxis=dict(title='Y (m)',range=[-length*.2,length*1.2]),
+        zaxis=dict(title='Z (m)',range=[-height*.5,height*1.7]),
+        camera=dict(eye=dict(x=1.5,y=1.65,z=.95),projection=dict(type='perspective'))))
+st.plotly_chart(fig,use_container_width=True,config={'scrollZoom':True,'displaylogo':False})
 st.caption('Amplía la figura con la rueda del ratón. Las líneas discontinuas son intersecciones de planos infinitos; no indican necesariamente cuñas inestables.')
 
 st.subheader('Resistencia por sistema de discontinuidades')
@@ -185,6 +192,67 @@ with b:
     st.checkbox('Malla metálica',value=('ST-III' in preset or 'ST-IV' in preset))
 with c:
     st.info('Los valores nominales y espesores se registran, pero NO se convierten automáticamente en resistencia movilizada. La aportación efectiva requiere conocer intersección, anclaje, orientación y modo de fallo.')
+
+st.subheader('Sección transversal 2D · disposición del sostenimiento')
+st.caption('Dibujo de distribución geométrica, NO comprobación estructural. Se muestra un anillo en la sección; la separación longitudinal se define arriba. El piso no se sostiene.')
+show_bolts=st.checkbox('Mostrar pernos',value=True,key='view_bolts')
+show_cables=st.checkbox('Mostrar cables',value=True,key='view_cables')
+show_mesh=st.checkbox('Mostrar malla',value=True,key='view_mesh')
+show_shot=st.checkbox('Mostrar gunita',value=True,key='view_shot')
+show_labels=st.checkbox('Etiquetar longitudes',value=False,key='view_labels')
+# Sección de herradura aproximada: hastiales verticales y bóveda semicircular.
+r=width/2.0
+wall=max(0.0,height-r)
+# Trayectoria desde el arranque izquierdo hasta el derecho, sin el piso.
+wall_n=24; arch_n=120
+xl=np.full(wall_n,-r); zl=np.linspace(0,wall,wall_n)
+theta=np.linspace(math.pi,0,arch_n)
+xa=r*np.cos(theta); za=wall+r*np.sin(theta)
+xr=np.full(wall_n,r); zr=np.linspace(wall,0,wall_n)
+xc=np.concatenate([xl,xa,xr]); zc=np.concatenate([zl,za,zr])
+# Normales exteriores al contorno, mediante derivada respecto a longitud de arco.
+seg=np.sqrt(np.diff(xc)**2+np.diff(zc)**2)
+cum=np.concatenate([[0],np.cumsum(seg)])
+# Se recorre del hastial izquierdo hacia arriba, por la clave, y baja por el derecho.
+# Normal exterior = (-dz/ds, dx/ds) para este sentido horario.
+dx=np.gradient(xc,cum); dz=np.gradient(zc,cum)
+nx=-dz; nz=dx
+norm=np.hypot(nx,nz); nx/=norm; nz/=norm
+fig2=go.Figure()
+fig2.add_trace(go.Scatter(x=xc,y=zc,mode='lines',name='Excavación',line=dict(color='#334155',width=5)))
+fig2.add_trace(go.Scatter(x=[-r,r],y=[0,0],mode='lines',name='Solera (sin soporte)',line=dict(color='#94a3b8',dash='dot',width=2)))
+if show_shot and shotcrete>0:
+    thickness=shotcrete/100.0
+    fig2.add_trace(go.Scatter(x=xc+nx*thickness,y=zc+nz*thickness,mode='lines',name=f'Gunita {shotcrete:g} cm',line=dict(color='#e87924',width=9)))
+if show_mesh and ('ST-III' in preset or 'ST-IV' in preset or preset=='Personalizado'):
+    fig2.add_trace(go.Scatter(x=xc+nx*.07,y=zc+nz*.07,mode='lines',name='Malla (esquemática)',line=dict(color='#22a06b',dash='dash',width=3)))
+# Reparto sobre longitud de contorno, incluyendo extremos, sin inventar recuentos reales.
+perimeter=float(cum[-1]); bolt_count=0
+if sx>0 and bolt_length>0 and show_bolts and preset!='Sin sostenimiento':
+    positions=np.arange(sx/2,perimeter,sx)
+    for pos in positions:
+        xx=np.interp(pos,cum,xc); zz=np.interp(pos,cum,zc)
+        ux=np.interp(pos,cum,nx); uz=np.interp(pos,cum,nz)
+        fig2.add_trace(go.Scatter(x=[xx,xx+bolt_length*ux],y=[zz,zz+bolt_length*uz],mode='lines+markers',
+            line=dict(color='#2563eb',width=3),marker=dict(size=[6,3]),name='Pernos 2,4 m' if bolt_count==0 else None,
+            showlegend=bolt_count==0,hovertemplate=f'Perno L={bolt_length:.2f} m<extra></extra>'))
+        if show_labels: fig2.add_annotation(x=xx+bolt_length*ux,y=zz+bolt_length*uz,text=f'{bolt_length:g} m',showarrow=False,font=dict(size=9))
+        bolt_count+=1
+# Los cables se dibujan en una sección de referencia, no como intersecciones reales con una cuña.
+if show_cables and cable_length>0 and preset!='Sin sostenimiento':
+    for j,pos in enumerate([perimeter*.25,perimeter*.5,perimeter*.75]):
+        xx=np.interp(pos,cum,xc); zz=np.interp(pos,cum,zc)
+        ux=np.interp(pos,cum,nx); uz=np.interp(pos,cum,nz)
+        fig2.add_trace(go.Scatter(x=[xx,xx+cable_length*ux],y=[zz,zz+cable_length*uz],mode='lines+markers',
+            line=dict(color='#b45309',width=4,dash='dash'),marker=dict(size=[7,3]),name='Cables (ejemplo)' if j==0 else None,
+            showlegend=j==0,hovertemplate=f'Cable L={cable_length:.1f} m<extra></extra>'))
+max_extent=max(width,height,bolt_length,cable_length)+2
+fig2.update_layout(height=670,margin=dict(l=5,r=5,t=10,b=5),
+    xaxis=dict(title='Transversal X (m)',scaleanchor='y',scaleratio=1,range=[-max_extent,max_extent]),
+    yaxis=dict(title='Altura Z (m)',range=[-1,max_extent+height*.5]),
+    legend=dict(orientation='h',y=-.16),dragmode='pan')
+st.plotly_chart(fig2,use_container_width=True,config={'scrollZoom':True,'displaylogo':False})
+st.caption(f'Perímetro aproximado sin piso: {perimeter:.2f} m. Pernos dibujados por anillo: {bolt_count}. La distribución es esquemática y no considera interferencias, juntas ni anclaje efectivo.')
 
 st.subheader('Equilibrio límite simplificado · bloque hipotético')
 st.caption('Se considera deslizamiento en UN plano con fuerza normal aproximada W cos(β) y fuerza tangencial W sen(β). No se resuelven deslizamientos por dos planos, caída libre, fuerzas 3D ni contacto real con pernos.')
