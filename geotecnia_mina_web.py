@@ -1,27 +1,32 @@
 
-"""Geotecnia Mina Web v9 — prototipo geométrico, no software de diseño."""
+"""Geotecnia Mina Web v10 - búsqueda preliminar de múltiples cuñas."""
 import io
 import json
-import math
 import itertools
+import math
 
 import numpy as np
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 from scipy.spatial import ConvexHull
 from skimage.measure import marching_cubes
-from shapely.geometry import Polygon, MultiPolygon
 
-st.set_page_config(page_title="Geotecnia Mina v9", layout="wide")
-st.title("Geotecnia Mina · v9")
+st.set_page_config(
+    page_title="Geotecnia Mina v10",
+    layout="wide"
+)
+
+st.title("Geotecnia Mina · v10")
 st.caption(
-    "Bóveda curva · cuñas 3D · cortes 2D · sostenimiento · DXF"
+    "Cuñas múltiples en bóveda y hastiales · "
+    "vistas 3D y 2D · sostenimiento"
 )
 st.warning(
-    "PROTOTIPO GEOMÉTRICO: el recorte de las cuñas por la bóveda "
-    "es aproximado. No se verifica la liberación de los bloques, "
-    "la persistencia real ni el factor de seguridad. "
-    "NO utilizar para dimensionamiento."
+    "PROTOTIPO GEOMÉTRICO. Se muestran candidatos obtenidos "
+    "de combinaciones de planos. No se garantiza que se hayan "
+    "identificado todas las cuñas reales, ni que sean liberables. "
+    "La persistencia se comprueba de forma simplificada. "
+    "No se calcula FS. No utilizar para dimensionamiento."
 )
 
 with st.sidebar:
@@ -29,165 +34,145 @@ with st.sidebar:
     W = st.number_input("Ancho (m)", 1.0, 25.0, 5.8, 0.1)
     H = st.number_input("Altura (m)", 1.0, 25.0, 5.8, 0.1)
     L = st.number_input("Longitud (m)", 2.0, 100.0, 15.0, 0.5)
-    az = st.number_input("Azimut del eje (°)", 0.0, 359.9, 0.0)
-    slope = st.number_input("Pendiente del eje (°)", -45.0, 45.0, 0.0)
-    dxf = st.file_uploader("Sección AutoCAD DXF", type=["dxf"])
-    st.caption("El DXF es una referencia gráfica, no modifica las cuñas.")
+    az = st.number_input("Azimut eje (°)", 0.0, 359.9, 0.0)
+    slope = st.number_input("Pendiente eje (°)", -45.0, 45.0, 0.0)
+    gamma = st.number_input(
+        "Peso específico (kN/m³)", 10.0, 40.0, 26.4, 0.1
+    )
+    number = st.slider(
+        "Planos por familia", 1, 5, 3,
+        help="Aumentarlo incrementa las combinaciones y el cálculo."
+    )
+    limit = st.slider("Máximo de candidatos a representar", 3, 30, 15)
+    dxf = st.file_uploader("Sección DXF", type=["dxf"])
 
 r = W / 2
 spring = H - r
-arc = np.linspace(np.pi, 0, 100)
+angles = np.linspace(np.pi, 0, 120)
+
 section = np.vstack((
     [-r, 0],
     [-r, spring],
     np.column_stack((
-        r * np.cos(arc),
-        spring + r * np.sin(arc)
+        r * np.cos(angles),
+        spring + r * np.sin(angles)
     )),
     [r, 0]
 ))
 
 methods = [
-    "Mohr-Coulomb (junta)",
-    "Barton-Bandis (junta)",
-    "Patton (junta)",
-    "Hoek-Brown (macizo, no junta)"
+    "Mohr-Coulomb",
+    "Barton-Bandis",
+    "Patton",
+    "Hoek-Brown (macizo)"
 ]
 
-t_data, t_wedge, t_support, t_dxf = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "Discontinuidades",
-    "Cuñas 3D y cortes 2D",
-    "Sostenimiento 2D",
+    "Todas las cuñas 3D",
+    "Cortes y sostenimiento",
     "Datos y DXF"
 ])
 
 systems = []
 
-with t_data:
-    st.caption(
-        "Introduce las orientaciones geográficas de las tres familias."
-    )
+with tab1:
     for i in range(3):
-        with st.expander(f"Sistema {i + 1}", expanded=False):
+        with st.expander(f"Familia {i + 1}", expanded=i == 0):
             a, b = st.columns(2)
             with a:
                 dd = st.number_input(
-                    "Dirección de buzamiento (°)",
-                    0.0, 359.9,
-                    [30.0, 150.0, 270.0][i],
-                    key=f"dd{i}"
+                    "Dirección buzamiento (°)", 0.0, 359.9,
+                    [30.0, 150.0, 270.0][i], key=f"dd{i}"
                 )
                 dp = st.number_input(
-                    "Buzamiento (°)",
-                    0.0, 90.0, 60.0,
-                    key=f"dp{i}"
+                    "Buzamiento (°)", 0.0, 90.0,
+                    60.0, key=f"dp{i}"
                 )
                 off = st.number_input(
-                    "Paso longitudinal Y (m)",
-                    0.0, L,
-                    [L * .58, L * .5, L * .42][i],
+                    "Posición longitudinal (m)", 0.0, L,
+                    L * [0.42, 0.50, 0.58][i],
                     key=f"off{i}"
                 )
                 xo = st.number_input(
-                    "Paso transversal X (m)",
-                    -W, W, 0.0,
-                    key=f"xo{i}"
+                    "Posición transversal (m)", -W, W,
+                    0.0, key=f"xo{i}"
                 )
-                pers = st.number_input(
-                    "Persistencia estimada (m)",
-                    0.1, 100.0, 5.0,
-                    key=f"pers{i}"
+                spacing = st.number_input(
+                    "Espaciamiento (m)", 0.1, 20.0,
+                    1.5, key=f"sp{i}"
                 )
-                sp = st.number_input(
-                    "Espaciamiento (m)",
-                    0.01, 50.0, 1.5,
-                    key=f"spc{i}"
+                persistence = st.number_input(
+                    "Persistencia (m)", 0.1, 100.0,
+                    5.0, key=f"pe{i}"
                 )
-
             with b:
                 method = st.selectbox(
-                    "Criterio resistente",
-                    methods,
-                    key=f"m{i}"
+                    "Criterio resistente", methods, key=f"m{i}"
                 )
                 props = {}
-                if method.startswith("Mohr"):
-                    props["cohesion_MPa"] = st.number_input(
-                        "Cohesión (MPa)", 0.0, 20.0, .05,
-                        key=f"c{i}"
+                if method == "Mohr-Coulomb":
+                    props["c_MPa"] = st.number_input(
+                        "Cohesión (MPa)", 0.0, 20.0,
+                        0.05, key=f"c{i}"
                     )
-                    props["friccion_deg"] = st.number_input(
-                        "Fricción (°)", 0.0, 89.0, 30.0,
-                        key=f"phi{i}"
+                    props["phi"] = st.number_input(
+                        "Fricción (°)", 0.0, 89.0,
+                        30.0, key=f"phi{i}"
                     )
-                elif method.startswith("Barton"):
+                elif method == "Barton-Bandis":
                     props["JRC"] = st.number_input(
-                        "JRC", 0.0, 25.0, 10.0,
-                        key=f"jrc{i}"
+                        "JRC", 0.0, 25.0, 10.0, key=f"jrc{i}"
                     )
-                    props["JCS_MPa"] = st.number_input(
-                        "JCS (MPa)", .01, 500.0, 30.0,
-                        key=f"jcs{i}"
+                    props["JCS"] = st.number_input(
+                        "JCS (MPa)", 0.1, 500.0,
+                        30.0, key=f"jcs{i}"
                     )
-                    props["friccion_residual_deg"] = st.number_input(
-                        "Fricción residual (°)",
-                        0.0, 89.0, 25.0,
-                        key=f"pr{i}"
+                    props["phi_r"] = st.number_input(
+                        "Fricción residual (°)", 0.0, 89.0,
+                        25.0, key=f"pr{i}"
                     )
-                elif method.startswith("Patton"):
-                    props["friccion_basica_deg"] = st.number_input(
-                        "Fricción básica (°)",
-                        0.0, 89.0, 25.0,
-                        key=f"pb{i}"
+                elif method == "Patton":
+                    props["phi_b"] = st.number_input(
+                        "Fricción básica (°)", 0.0, 89.0,
+                        25.0, key=f"pb{i}"
                     )
-                    props["asperidad_deg"] = st.number_input(
-                        "Inclinación asperidades (°)",
-                        0.0, 60.0, 10.0,
-                        key=f"asp{i}"
+                    props["i"] = st.number_input(
+                        "Ángulo asperidades (°)", 0.0, 60.0,
+                        10.0, key=f"as{i}"
                     )
                 else:
-                    props["UCS_MPa"] = st.number_input(
-                        "UCS (MPa)", .1, 500.0, 52.6,
-                        key=f"ucs{i}"
-                    )
-                    props["mi"] = st.number_input(
-                        "mi", .1, 100.0, 20.0,
-                        key=f"mi{i}"
+                    props["UCS"] = st.number_input(
+                        "UCS (MPa)", 0.1, 500.0,
+                        52.6, key=f"ucs{i}"
                     )
                     props["GSI"] = st.number_input(
-                        "GSI", 1.0, 100.0, 50.0,
-                        key=f"gsi{i}"
-                    )
-                    props["D"] = st.number_input(
-                        "D", 0.0, 1.0, 0.0,
-                        key=f"d{i}"
+                        "GSI", 1.0, 100.0, 50.0, key=f"gsi{i}"
                     )
                     st.info(
-                        "Hoek-Brown caracteriza el macizo, "
-                        "no una junta de deslizamiento."
+                        "Hoek-Brown describe el macizo, "
+                        "no la resistencia de una junta."
                     )
-
                 props["agua_MPa"] = st.number_input(
-                    "Presión de agua (MPa)",
-                    0.0, 10.0, 0.0,
-                    key=f"water{i}"
+                    "Presión de agua (MPa)", 0.0, 10.0,
+                    0.0, key=f"water{i}"
                 )
 
-        systems.append(dict(
-            dipdir=dd,
-            dip=dp,
-            offset=off,
-            xoff=xo,
-            persist=pers,
-            spacing=sp,
-            method=method,
-            props=props
-        ))
+            systems.append(dict(
+                dd=dd, dp=dp, off=off, xo=xo,
+                spacing=spacing, persistence=persistence,
+                method=method, props=props
+            ))
+
+
+def roof(x):
+    x = np.asarray(x)
+    return spring + np.sqrt(np.maximum(0, r*r - x*x))
 
 
 def normal(s):
-    theta = np.deg2rad(s["dipdir"] - az)
-    dip = np.deg2rad(s["dip"])
+    theta = np.deg2rad(s["dd"] - az)
+    dip = np.deg2rad(s["dp"])
     return np.array([
         np.sin(theta) * np.sin(dip),
         np.cos(theta) * np.sin(dip),
@@ -195,385 +180,309 @@ def normal(s):
     ])
 
 
-def field_tetra():
-    ns = [normal(s) for s in systems]
-    points = [
-        np.array([s["xoff"], s["offset"], H])
-        for s in systems
-    ]
-    A = np.array(ns)
-    rhs = np.array([
-        n @ p for n, p in zip(ns, points)
-    ])
+def generate_planes():
+    families = []
+    for s in systems:
+        n = normal(s)
+        p = np.array([s["xo"], s["off"], H])
+        base = n @ p
+        planes = []
+        for k in range(number):
+            shift = (k - (number - 1) / 2) * s["spacing"]
+            planes.append((n, base + shift, s["persistence"]))
+        families.append(planes)
+    return families
 
-    if abs(np.linalg.det(A)) < 1e-9:
-        return None, "Planos degenerados."
 
-    apex = np.linalg.solve(A, rhs)
-    if apex[2] <= H + 1e-7:
-        return None, "Vértice por debajo de la clave."
+def tetra_candidate(planes, surface):
+    ns = np.array([p[0] for p in planes])
+    rhs = np.array([p[1] for p in planes])
 
-    base_z = spring
-    v = [apex]
+    if abs(np.linalg.det(ns)) < 1e-7:
+        return None
 
+    apex = np.linalg.solve(ns, rhs)
+
+    if surface == "Bóveda":
+        axis, value = 2, spring
+        if apex[2] <= H:
+            return None
+        if abs(apex[0]) > r * 1.6:
+            return None
+    elif surface == "Hastial derecho":
+        axis, value = 0, 0.0
+        if apex[0] <= r:
+            return None
+        if apex[2] < -1 or apex[2] > H + 1:
+            return None
+    else:
+        axis, value = 0, 0.0
+        if apex[0] >= -r:
+            return None
+        if apex[2] < -1 or apex[2] > H + 1:
+            return None
+
+    vertices = [apex]
     for i, j in [(0, 1), (0, 2), (1, 2)]:
         mat = np.array([
-            ns[i], ns[j], [0, 0, 1.0]
+            ns[i], ns[j], np.eye(3)[axis]
         ])
-        if abs(np.linalg.det(mat)) < 1e-9:
-            return None, "Intersección degenerada."
-        v.append(np.linalg.solve(
-            mat,
-            np.array([rhs[i], rhs[j], base_z])
-        ))
+        if abs(np.linalg.det(mat)) < 1e-8:
+            return None
+        point = np.linalg.solve(
+            mat, [rhs[i], rhs[j], value]
+        )
+        vertices.append(point)
 
-    v = np.array(v)
-    if not np.isfinite(v).all():
-        return None, "Coordenadas no válidas."
+    vertices = np.array(vertices)
 
-    if v[:, 1].min() < 0 or v[:, 1].max() > L:
-        return None, "Bloque fuera del tramo longitudinal."
+    if not np.isfinite(vertices).all():
+        return None
+
+    if vertices[:, 1].max() < 0 or vertices[:, 1].min() > L:
+        return None
 
     try:
-        hull = ConvexHull(v)
+        hull = ConvexHull(vertices)
     except Exception:
-        return None, "Geometría degenerada."
+        return None
 
-    if hull.volume < 1e-7:
-        return None, "Volumen degenerado."
+    if hull.volume < 1e-6:
+        return None
 
     edge = max(
-        np.linalg.norm(v[i] - v[j])
+        np.linalg.norm(vertices[i] - vertices[j])
         for i, j in itertools.combinations(range(4), 2)
     )
 
-    warning = None
-    if edge > min(s["persist"] for s in systems):
-        warning = (
-            f"Extensión auxiliar {edge:.2f} m superior "
-            "a la persistencia indicada. "
-            "Bloque no verificado."
-        )
-
-    return (v, hull, warning), None
-
-
-def demo_tetra():
-    v = np.array([
-        [0.0, L * .5, H + min(2.1, H * .35)],
-        [-min(r * .65, 1.6), L * .5 - 1.4, H],
-        [min(r * .65, 1.6), L * .5 - 1.4, H],
-        [0.0, L * .5 + 1.5, H]
-    ])
-    return (
-        v,
-        ConvexHull(v),
-        "Ejemplo didáctico, no procede de las familias introducidas."
+    valid_persistence = all(
+        edge <= p[2] for p in planes
     )
-
-
-def roof_height(x):
-    return spring + np.sqrt(
-        np.maximum(0.0, r * r - np.asarray(x) ** 2)
-    )
+    return vertices, valid_persistence, edge
 
 
 @st.cache_data(show_spinner=False)
-def curved_mesh(vertices_tuple, width, height, length, resolution=64):
-    vv = np.array(vertices_tuple, dtype=float)
-    hh = ConvexHull(vv)
+def clip_mesh(vertices_data, surface, width, height, length):
+    """Intersección numérica aproximada del tetraedro con roca exterior."""
+    v = np.array(vertices_data)
     rr = width / 2
     ss = height - rr
 
+    hull = ConvexHull(v)
     lo = np.maximum(
-        vv.min(axis=0) - .15,
-        [-rr - .15, 0.0, ss - .15]
+        v.min(axis=0) - .1,
+        [-width * 2, 0, -0.1]
     )
     hi = np.minimum(
-        vv.max(axis=0) + .15,
-        [
-            rr + .15,
-            length,
-            height + max(.5, vv[:, 2].max() - height) + .15
-        ]
+        v.max(axis=0) + .1,
+        [width * 2, length, height + width * 2]
     )
 
     if np.any(hi - lo < .05):
         return None
 
-    nx = resolution
-    ny = max(
-        28,
-        int(resolution * (hi[1] - lo[1]) /
-            max(hi[0] - lo[0], .1))
-    )
-    nz = max(
-        28,
-        int(resolution * (hi[2] - lo[2]) /
-            max(hi[0] - lo[0], .1))
-    )
-
-    nx, ny, nz = (
-        min(nx, 90),
-        min(ny, 105),
-        min(nz, 105)
+    sizes = hi - lo
+    nxyz = np.maximum(
+        20,
+        np.minimum(
+            62,
+            np.ceil(42 * sizes / max(sizes)).astype(int)
+        )
     )
 
     axes = [
-        np.linspace(lo[k], hi[k], n)
-        for k, n in enumerate((nx, ny, nz))
+        np.linspace(lo[i], hi[i], int(nxyz[i]))
+        for i in range(3)
     ]
     X, Y, Z = np.meshgrid(*axes, indexing="ij")
 
-    signed = np.maximum.reduce([
-        eq[0] * X + eq[1] * Y +
-        eq[2] * Z + eq[3]
-        for eq in hh.equations
+    inside = np.maximum.reduce([
+        e[0]*X + e[1]*Y + e[2]*Z + e[3]
+        for e in hull.equations
     ])
 
-    roof = ss + np.sqrt(
-        np.maximum(0.0, rr * rr - X * X)
-    )
-    field = np.maximum(signed, roof - Z)
-    field = np.maximum(field, abs(X) - rr)
+    if surface == "Bóveda":
+        rr2 = np.sqrt(np.maximum(0, rr*rr-X*X))
+        boundary = ss + rr2 - Z
+        boundary = np.maximum(boundary, np.abs(X)-rr)
+    elif surface == "Hastial derecho":
+        boundary = rr-X
+        boundary = np.maximum(boundary, -Z)
+        boundary = np.maximum(boundary, Z-ss)
+    else:
+        boundary = X+rr
+        boundary = np.maximum(boundary, -Z)
+        boundary = np.maximum(boundary, Z-ss)
+
+    field = np.maximum(inside, boundary)
     field = np.maximum(field, -Y)
-    field = np.maximum(field, Y - length)
+    field = np.maximum(field, Y-length)
 
     if field.min() >= 0 or field.max() <= 0:
         return None
 
-    step = [a[1] - a[0] for a in axes]
-    verts, faces, _, _ = marching_cubes(
-        field.astype(np.float32),
-        level=0,
-        spacing=tuple(step)
-    )
-    verts += lo
+    step = np.array([
+        a[1]-a[0] for a in axes
+    ])
 
-    volume = float(
-        np.count_nonzero(field < 0) * np.prod(step)
-    )
-    return verts, faces, volume, max(step)
-
-
-def slice_polygon(vertices, axis, value):
-    pts = []
-    for i, j in itertools.combinations(range(4), 2):
-        a, b = vertices[i], vertices[j]
-        da = a[axis] - value
-        db = b[axis] - value
-
-        if abs(da) < 1e-9:
-            pts.append(a)
-        if abs(db) < 1e-9:
-            pts.append(b)
-        if da * db < 0:
-            t = -da / (db - da)
-            pts.append(a + t * (b - a))
-
-    unique = []
-    for p in pts:
-        if not any(
-            np.linalg.norm(p - q) < 1e-7
-            for q in unique
-        ):
-            unique.append(p)
-
-    if len(unique) < 3:
+    try:
+        verts, faces, _, _ = marching_cubes(
+            field.astype(np.float32),
+            level=0,
+            spacing=tuple(step)
+        )
+    except Exception:
         return None
 
-    q = np.array(unique)
-    dims = [k for k in range(3) if k != axis]
-    center = q[:, dims].mean(axis=0)
-    order = np.argsort(np.arctan2(
-        q[:, dims[1]] - center[1],
-        q[:, dims[0]] - center[0]
-    ))
-    q = q[order]
+    verts += lo
+    volume = np.count_nonzero(field < 0) * np.prod(step)
 
-    if axis == 1:
-        original = Polygon([
-            (float(p[0]), float(p[2]))
-            for p in q
-        ])
-        if not original.is_valid:
-            original = original.buffer(0)
+    if volume < .005:
+        return None
 
-        xx = np.linspace(-r, r, 180)
-        upper = Polygon(
-            [
-                (float(x), float(z))
-                for x, z in zip(xx, roof_height(xx))
-            ] +
-            [(r, H + 1000), (-r, H + 1000)]
-        )
-        intersection = original.intersection(upper)
+    return verts, faces, float(volume)
 
-        if intersection.is_empty:
-            return None
-        if isinstance(intersection, MultiPolygon):
-            intersection = max(
-                intersection.geoms,
-                key=lambda g: g.area
+
+def mesh_cut(vertices, faces, axis, value):
+    """Segmentos del corte obtenidos de la misma malla 3D."""
+    segments = []
+    for tri in faces:
+        points = vertices[tri]
+        distances = points[:, axis] - value
+        intersections = []
+
+        for i, j in [(0, 1), (1, 2), (2, 0)]:
+            a, b = distances[i], distances[j]
+            if a*b < 0:
+                t = -a / (b-a)
+                intersections.append(
+                    points[i] + t*(points[j]-points[i])
+                )
+
+        if len(intersections) == 2:
+            segments.append(intersections)
+
+    return segments
+
+
+def compute_candidates():
+    families = generate_planes()
+    results = []
+    seen = set()
+
+    for indices in itertools.product(range(number), repeat=3):
+        planes = [
+            families[i][indices[i]] for i in range(3)
+        ]
+        for surface in [
+            "Bóveda", "Hastial izquierdo", "Hastial derecho"
+        ]:
+            result = tetra_candidate(planes, surface)
+            if result is None:
+                continue
+
+            v, persistence_ok, edge = result
+            key = (
+                surface,
+                tuple(np.round(v[0], 2))
             )
-        if (
-            not isinstance(intersection, Polygon)
-            or intersection.area < 1e-8
-        ):
-            return None
+            if key in seen:
+                continue
+            seen.add(key)
 
-        xy = np.array(intersection.exterior.coords)[:-1]
-        return np.column_stack((
-            xy[:, 0],
-            np.full(len(xy), value),
-            xy[:, 1]
-        ))
+            mesh = clip_mesh(
+                tuple(map(tuple, v)), surface, W, H, L
+            )
+            if mesh is None:
+                continue
 
-    return q
+            mv, mf, volume = mesh
+            results.append(dict(
+                name=f"C{len(results)+1}",
+                surface=surface,
+                verts=mv,
+                faces=mf,
+                volume=volume,
+                weight=volume*gamma,
+                persistence_ok=persistence_ok,
+                edge=edge,
+                center=mv.mean(axis=0),
+                planes=tuple(i+1 for i in indices)
+            ))
+
+    results.sort(key=lambda c: c["volume"], reverse=True)
+    return results
 
 
-with t_wedge:
-    st.subheader("Cuñas geométricas 3D")
+with st.spinner("Buscando cuñas geométricas candidatas..."):
+    all_candidates = compute_candidates()
 
-    mode = st.radio(
-        "Origen de la geometría",
-        [
-            "Tres discontinuidades introducidas",
-            "Ejemplo cerrado para comprobar el visor"
-        ],
-        horizontal=True,
-        key="modo_cuna"
+candidates = all_candidates[:limit]
+
+colors = [
+    "#ea580c", "#2563eb", "#16a34a",
+    "#9333ea", "#dc2626", "#0891b2",
+    "#ca8a04", "#db2777", "#4f46e5"
+]
+
+with tab2:
+    st.subheader("Cuñas candidatas en bóveda y hastiales")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Candidatos encontrados", len(all_candidates))
+    c2.metric("Representados", len(candidates))
+    c3.metric(
+        "Con persistencia compatible",
+        sum(c["persistence_ok"] for c in all_candidates)
     )
 
-    if mode.startswith("Ejemplo"):
-        v, hull, warning = demo_tetra()
-        error = None
-        st.info("Ejemplo didáctico, no representa una cuña medida.")
-    else:
-        result, error = field_tetra()
-        if result:
-            v, hull, warning = result
-        else:
-            v = hull = warning = None
+    if len(all_candidates) > limit:
+        st.info(
+            "Se muestran los candidatos de mayor volumen. "
+            "Aumenta el límite para visualizar más."
+        )
 
     fig = go.Figure()
 
-    for yy in [0, L]:
+    for y in [0, L]:
         fig.add_trace(go.Scatter3d(
             x=section[:, 0],
-            y=np.full(len(section), yy),
+            y=np.full(len(section), y),
             z=section[:, 1],
             mode="lines",
-            line=dict(color="#64748b", width=6),
+            line=dict(color="#64748b", width=5),
             name="Galería",
-            showlegend=yy == 0
+            showlegend=y == 0
         ))
 
-    for k in [0, 20, 45, 70, 99]:
-        fig.add_trace(go.Scatter3d(
-            x=[section[k, 0]] * 2,
-            y=[0, L],
-            z=[section[k, 1]] * 2,
-            mode="lines",
-            line=dict(color="#cbd5e1", width=2),
-            showlegend=False
+    for i, c in enumerate(candidates):
+        v, faces = c["verts"], c["faces"]
+        color = colors[i % len(colors)]
+        fig.add_trace(go.Mesh3d(
+            x=v[:, 0], y=v[:, 1], z=v[:, 2],
+            i=faces[:, 0],
+            j=faces[:, 1],
+            k=faces[:, 2],
+            color=color,
+            opacity=.75,
+            flatshading=True,
+            name=f'{c["name"]} · {c["surface"]}',
+            showlegend=True
         ))
-
-    mesh = None
-
-    if v is not None:
-        mesh = curved_mesh(
-            tuple(map(tuple, v)), W, H, L
-        )
-
-        if mesh is not None:
-            mv, mf, mvolume, voxel = mesh
-            fig.add_trace(go.Mesh3d(
-                x=mv[:, 0],
-                y=mv[:, 1],
-                z=mv[:, 2],
-                i=mf[:, 0],
-                j=mf[:, 1],
-                k=mf[:, 2],
-                color="#ea580c",
-                opacity=.84,
-                flatshading=True,
-                name="Bloque recortado por bóveda"
-            ))
-
-            if warning:
-                st.warning(warning)
-
-            gamma = st.number_input(
-                "Peso específico (kN/m³)",
-                10.0, 40.0, 26.4, .1
-            )
-            c1, c2, c3 = st.columns(3)
-            c1.metric(
-                "Volumen aproximado (m³)",
-                f"{mvolume:.3f}"
-            )
-            c2.metric(
-                "Peso aproximado (kN)",
-                f"{mvolume * gamma:.1f}"
-            )
-            c3.metric("FS", "No calculado")
-
-            st.caption(
-                f"Resolución aproximada de malla: "
-                f"{voxel:.2f} m. "
-                "El volumen depende de la resolución."
-            )
-            center = mv.mean(axis=0)
-            extent = max(
-                W, 4.0,
-                np.max(np.ptp(mv, axis=0)) * 1.8
-            )
-        else:
-            st.info(
-                "No se obtiene volumen de cuña "
-                "por encima de la bóveda."
-            )
-            center = np.array([0, L / 2, H])
-            extent = max(W, H, 6.0) * 1.8
-    else:
-        st.info(
-            "No se ha formado una cuña candidata: "
-            + str(error)
-        )
-        center = np.array([0, L / 2, H / 2])
-        extent = max(W, H, 6.0) * 2
 
     fig.update_layout(
-        height=680,
+        height=780,
         margin=dict(l=0, r=0, t=0, b=0),
         scene=dict(
-            xaxis=dict(
-                title="X (m)",
-                range=[
-                    center[0] - extent / 2,
-                    center[0] + extent / 2
-                ]
-            ),
-            yaxis=dict(
-                title="Y (m)",
-                range=[
-                    center[1] - extent / 2,
-                    center[1] + extent / 2
-                ]
-            ),
-            zaxis=dict(
-                title="Z (m)",
-                range=[
-                    max(0, center[2] - extent / 2),
-                    center[2] + extent / 2
-                ]
-            ),
-            aspectmode="cube",
+            xaxis_title="X (m)",
+            yaxis_title="Y (m)",
+            zaxis_title="Z (m)",
+            aspectmode="data",
             camera=dict(
-                eye=dict(x=1.35, y=-1.35, z=.95)
+                eye=dict(x=1.5, y=-1.5, z=.9)
             )
-        )
+        ),
+        legend=dict(orientation="h")
     )
     st.plotly_chart(
         fig,
@@ -581,250 +490,121 @@ with t_wedge:
         config={"scrollZoom": True}
     )
 
-    st.subheader("Cortes 2D")
-    a, b = st.columns(2)
-
-    with a:
-        ycut = st.slider(
-            "Corte transversal Y (m)",
-            0.0, float(L), float(L / 2), .1
+    if candidates:
+        rows = []
+        for c in candidates:
+            rows.append({
+                "Cuña": c["name"],
+                "Ubicación": c["surface"],
+                "Volumen aprox. (m³)": round(c["volume"], 3),
+                "Peso aprox. (kN)": round(c["weight"], 1),
+                "Persistencia compatible": (
+                    "Sí, preliminar"
+                    if c["persistence_ok"] else "No"
+                ),
+                "FS": "No calculado"
+            })
+        st.dataframe(rows, use_container_width=True)
+    else:
+        st.info(
+            "No se han encontrado candidatos con estas "
+            "combinaciones y límites de búsqueda. "
+            "Esto no demuestra ausencia de cuñas reales."
         )
-        fc = go.Figure()
-        fc.add_trace(go.Scatter(
-            x=section[:, 0],
-            y=section[:, 1],
-            mode="lines",
-            line=dict(color="#334155", width=5),
-            name="Galería"
-        ))
-
-        poly = (
-            slice_polygon(v, 1, ycut)
-            if v is not None and mesh is not None
-            else None
-        )
-
-        if poly is not None:
-            fc.add_trace(go.Scatter(
-                x=np.r_[poly[:, 0], poly[0, 0]],
-                y=np.r_[poly[:, 2], poly[0, 2]],
-                fill="toself",
-                mode="lines",
-                line=dict(color="#c2410c", width=3),
-                fillcolor="rgba(234,88,12,.5)",
-                name="Sección de cuña"
-            ))
-
-        fc.update_layout(
-            height=480,
-            xaxis=dict(
-                title="X (m)",
-                scaleanchor="y",
-                scaleratio=1
-            ),
-            yaxis_title="Z (m)"
-        )
-        st.plotly_chart(fc, use_container_width=True)
-
-    with b:
-        xcut = st.slider(
-            "Corte longitudinal X (m)",
-            float(-r), float(r), 0.0, .1
-        )
-        fl = go.Figure()
-        fl.add_hline(
-            y=H, line_dash="dash",
-            line_color="#64748b"
-        )
-
-        poly = (
-            slice_polygon(v, 0, xcut)
-            if v is not None and mesh is not None
-            else None
-        )
-
-        if poly is not None:
-            fl.add_trace(go.Scatter(
-                x=np.r_[poly[:, 1], poly[0, 1]],
-                y=np.r_[poly[:, 2], poly[0, 2]],
-                fill="toself",
-                mode="lines",
-                line=dict(color="#c2410c", width=3),
-                fillcolor="rgba(234,88,12,.5)",
-                name="Sección auxiliar"
-            ))
-
-        fl.update_layout(
-            height=480,
-            xaxis_title="Y (m)",
-            yaxis=dict(
-                title="Z (m)",
-                scaleanchor="x",
-                scaleratio=1
-            )
-        )
-        st.plotly_chart(fl, use_container_width=True)
-
-    st.caption(
-        "El corte transversal se recorta por la bóveda. "
-        "El longitudinal todavía muestra el tetraedro auxiliar."
-    )
 
 
 presets = {
-    "ST-I": (2.0, 2.0, .03, 0.0, 2.0, False),
-    "ST-II": (2.0, 2.0, .03, 0.0, 2.0, False),
-    "ST-III": (1.5, 1.5, .08, 0.0, 1.5, True),
-    "ST-IV superficial": (1.5, 1.5, .12, 8.0, 1.5, True),
-    "ST-IV profundo": (1.5, 1.5, .15, 10.0, 1.0, True),
-    "Personalizado": (1.5, 1.5, .08, 0.0, 1.5, True)
+    "ST-I": (2.0, .03, 0.0, False),
+    "ST-II": (2.0, .03, 0.0, False),
+    "ST-III": (1.5, .08, 0.0, True),
+    "ST-IV superficial": (1.5, .12, 8.0, True),
+    "ST-IV profundo": (1.5, .15, 10.0, True),
+    "Personalizado": (1.5, .08, 0.0, True)
 }
 
-with t_support:
-    st.subheader("Sostenimiento transversal 2D")
+with tab3:
+    st.subheader("Cuñas y sostenimiento en la misma sección")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        preset = st.selectbox(
-            "Sostenimiento tipo",
-            list(presets)
-        )
-        bolt_type = st.selectbox(
-            "Pernos",
-            ["Resina", "Split Set", "Swellex", "Sin pernos"]
-        )
-
-    with c2:
-        shot_on = st.checkbox("Gunita", value=True)
-        mesh_on = st.checkbox(
-            "Malla metálica",
-            value=presets[preset][5]
-        )
-
-    dx, dy, shot_default, cable_default, cable_spacing, _ = (
+    preset = st.selectbox("Sostenimiento tipo", list(presets))
+    bolt_spacing, shot_default, cable_default, mesh_default = (
         presets[preset]
     )
 
-    with st.expander("Pernos · propiedades y patrón"):
-        boltlen = st.number_input(
+    a, b = st.columns(2)
+    with a:
+        bolt_type = st.selectbox(
+            "Tipo de perno",
+            ["Resina", "Split Set", "Swellex", "Sin pernos"]
+        )
+        bolt_length = st.number_input(
             "Longitud pernos (m)", .5, 12.0, 2.4
         )
-        boltcap = st.number_input(
-            "Capacidad nominal (kN)", 1.0, 1000.0, 324.0
+        bolt_spacing = st.number_input(
+            "Separación transversal pernos (m)",
+            .3, 5.0, bolt_spacing
         )
-        spacing = st.number_input(
-            "Separación transversal (m)",
-            .3, 5.0, dx
+        bolt_longspacing = st.number_input(
+            "Separación longitudinal pernos (m)",
+            .3, 5.0, 1.5
         )
-        longspacing = st.number_input(
-            "Separación longitudinal (m)",
-            .3, 5.0, dy
+        bolt_capacity = st.number_input(
+            "Capacidad nominal perno (kN)",
+            1.0, 1000.0, 324.0
+        )
+    with b:
+        shot_on = st.checkbox("Gunita", True)
+        shot_cm = st.number_input(
+            "Espesor gunita (cm)", 0.0, 50.0,
+            shot_default*100, .5,
+            disabled=not shot_on
+        )
+        shot_fc = st.number_input(
+            "fc gunita (MPa)", 1.0, 100.0, 35.0
+        )
+        shot_ft = st.number_input(
+            "ft gunita (MPa)", 0.0, 20.0, 3.0
+        )
+        shot_E = st.number_input(
+            "E gunita (GPa)", 1.0, 80.0, 30.0
+        )
+        mesh_on = st.checkbox(
+            "Malla metálica", mesh_default
+        )
+        cable_on = st.checkbox(
+            "Cables", cable_default > 0
+        )
+        cable_length = st.number_input(
+            "Longitud cables (m)", 1.0, 25.0,
+            cable_default if cable_default else 8.0,
+            disabled=not cable_on
+        )
+        cable_spacing = st.number_input(
+            "Separación transversal cables (m)",
+            .3, 6.0,
+            1.0 if preset == "ST-IV profundo" else 1.5
+        )
+        cable_capacity = st.number_input(
+            "Capacidad cable (kN)", 1.0, 1500.0, 350.0
         )
 
-    if shot_on:
-        with st.expander("Gunita · espesor y propiedades"):
-            shot_cm = st.number_input(
-                "Espesor total (cm)",
-                0.0, 50.0,
-                shot_default * 100, .5
-            )
-            shot_fc = st.number_input(
-                "Resistencia compresión (MPa)",
-                1.0, 100.0, 35.0
-            )
-            shot_ft = st.number_input(
-                "Resistencia tracción (MPa)",
-                0.0, 20.0, 3.0
-            )
-            shot_E = st.number_input(
-                "Módulo elástico (GPa)",
-                1.0, 80.0, 30.0
-            )
-            shot_phase = st.selectbox(
-                "Aplicación",
-                ["Una capa", "Dos capas (inicial y final)"]
-            )
-            if shot_phase.startswith("Dos"):
-                shot_first = st.number_input(
-                    "Primera capa (cm)",
-                    0.0,
-                    float(shot_cm),
-                    min(5.0, float(shot_cm)),
-                    .5
-                )
-                st.caption(
-                    f"Segunda capa: "
-                    f"{shot_cm - shot_first:.1f} cm"
-                )
+    if candidates:
+        ycenters = [c["center"][1] for c in candidates]
+        default_y = float(np.clip(ycenters[0], 0, L))
     else:
-        shot_cm = 0.0
+        default_y = L/2
 
-    cable_on = st.checkbox(
-        "Cables de anclaje",
-        value=cable_default > 0
+    ycut = st.slider(
+        "Corte transversal Y (m)",
+        0.0, float(L),
+        round(default_y, 1), .1
     )
 
-    if cable_on:
-        with st.expander("Cables · propiedades y patrón"):
-            cablelen = st.number_input(
-                "Longitud cables (m)",
-                1.0, 25.0,
-                cable_default if cable_default > 0 else 8.0
-            )
-            cablecap = st.number_input(
-                "Capacidad nominal cable (kN)",
-                1.0, 1500.0, 350.0
-            )
-            cable_spacing = st.number_input(
-                "Separación transversal cables (m)",
-                .3, 6.0, cable_spacing
-            )
-    else:
-        cablelen = 0.0
-
-    if mesh_on:
-        with st.expander("Malla · propiedades"):
-            mesh_type = st.text_input(
-                "Tipo de malla",
-                "Electrosoldada / metálica"
-            )
-            mesh_overlap = st.number_input(
-                "Solape (%)", 0.0, 50.0, 10.0
-            )
-
-    cut_support = st.slider(
-        "Posición del corte transversal (Y, m)",
-        0.0, float(L), float(L / 2), .1,
-        key="corte_sostenimiento"
-    )
-    show_wedge = st.checkbox(
-        "Mostrar cuña en sección de sostenimiento",
-        value=True
+    xcut = st.slider(
+        "Corte longitudinal X (m)",
+        -float(W), float(W), 0.0, .1
     )
 
     f = go.Figure()
-
-    if show_wedge and v is not None and mesh is not None:
-        cutpoly = slice_polygon(v, 1, cut_support)
-        if cutpoly is not None:
-            f.add_trace(go.Scatter(
-                x=np.r_[cutpoly[:, 0], cutpoly[0, 0]],
-                y=np.r_[cutpoly[:, 2], cutpoly[0, 2]],
-                mode="lines",
-                fill="toself",
-                fillcolor="rgba(234,88,12,.38)",
-                line=dict(color="#c2410c", width=3),
-                name="Cuña"
-            ))
-        else:
-            st.info(
-                "El corte seleccionado no atraviesa el bloque."
-            )
-    elif show_wedge:
-        st.warning(
-            "No existe cuña candidata con los datos actuales."
-        )
-
     f.add_trace(go.Scatter(
         x=section[:, 0],
         y=section[:, 1],
@@ -833,18 +613,34 @@ with t_support:
         name="Excavación"
     ))
 
-    if shot_cm > 0:
+    for i, c in enumerate(candidates):
+        segments = mesh_cut(
+            c["verts"], c["faces"], 1, ycut
+        )
+        color = colors[i % len(colors)]
+        for j, segment in enumerate(segments):
+            p, q = segment
+            f.add_trace(go.Scatter(
+                x=[p[0], q[0]],
+                y=[p[2], q[2]],
+                mode="lines",
+                line=dict(color=color, width=3),
+                name=c["name"],
+                showlegend=j == 0
+            ))
+
+    if shot_on and shot_cm > 0:
         ext = section.copy()
         ext[1:-1, 0] += (
-            np.sign(ext[1:-1, 0]) * shot_cm / 100
+            np.sign(ext[1:-1, 0]) * shot_cm/100
         )
-        ext[1:-1, 1] += shot_cm / 100
+        ext[1:-1, 1] += shot_cm/100
         f.add_trace(go.Scatter(
             x=ext[:, 0],
             y=ext[:, 1],
             mode="lines",
-            line=dict(color="#f97316", width=9),
-            name=f"Gunita {shot_cm:g} cm"
+            line=dict(color="#f97316", width=7),
+            name="Gunita (esquema)"
         ))
 
     if mesh_on:
@@ -860,54 +656,61 @@ with t_support:
             name="Malla"
         ))
 
-    per = section
-    seg = np.linalg.norm(np.diff(per, axis=0), axis=1)
+    seg = np.linalg.norm(
+        np.diff(section, axis=0), axis=1
+    )
     cum = np.r_[0, np.cumsum(seg)]
 
     if bolt_type != "Sin pernos":
         for k, s in enumerate(
-            np.arange(spacing / 2, cum[-1], spacing)
+            np.arange(
+                bolt_spacing/2, cum[-1], bolt_spacing
+            )
         ):
             ix = np.clip(
-                np.searchsorted(cum, s) - 1,
-                0, len(seg) - 1
+                np.searchsorted(cum, s)-1,
+                0, len(seg)-1
             )
-            t = (s - cum[ix]) / max(seg[ix], 1e-9)
-            p = per[ix] * (1 - t) + per[ix + 1] * t
+            t = (s-cum[ix])/max(seg[ix], 1e-9)
+            p = (
+                section[ix]*(1-t)
+                + section[ix+1]*t
+            )
 
-            if abs(p[0]) >= r - 1e-5 and p[1] <= spring:
+            if p[1] <= spring and abs(p[0]) > r-.01:
                 n = np.array([np.sign(p[0]), 0.0])
             else:
-                n = np.array([p[0], p[1] - spring])
-                n /= max(np.linalg.norm(n), 1e-8)
+                n = np.array([p[0], p[1]-spring])
+                n /= max(np.linalg.norm(n), 1e-9)
 
-            q = p + boltlen * n
+            q = p + bolt_length*n
             f.add_trace(go.Scatter(
                 x=[p[0], q[0]],
                 y=[p[1], q[1]],
-                mode="lines+markers",
+                mode="lines",
                 line=dict(color="#2563eb", width=4),
-                marker=dict(size=4),
-                name=f"Pernos {bolt_type}" if k == 0 else None,
+                name="Pernos" if k == 0 else None,
                 showlegend=k == 0
             ))
 
-    if cablelen > 0:
+    if cable_on:
         for k, s in enumerate(
-            np.arange(cable_spacing / 2, math.pi * r,
-                      cable_spacing)
+            np.arange(
+                cable_spacing/2,
+                math.pi*r,
+                cable_spacing
+            )
         ):
-            angle = math.pi - s / r
+            angle = math.pi-s/r
             p = np.array([
-                r * math.cos(angle),
-                spring + r * math.sin(angle)
+                r*math.cos(angle),
+                spring+r*math.sin(angle)
             ])
             n = np.array([
                 math.cos(angle),
                 math.sin(angle)
             ])
-            q = p + cablelen * n
-
+            q = p+cable_length*n
             f.add_trace(go.Scatter(
                 x=[p[0], q[0]],
                 y=[p[1], q[1]],
@@ -918,52 +721,73 @@ with t_support:
             ))
 
     f.update_layout(
-        height=650,
+        height=700,
         xaxis=dict(
             title="X (m)",
             scaleanchor="y",
             scaleratio=1
         ),
         yaxis_title="Z (m)",
-        margin=dict(l=0, r=0, t=5, b=0),
         legend=dict(orientation="h")
     )
     st.plotly_chart(f, use_container_width=True)
 
+    st.subheader("Corte longitudinal de las mismas mallas 3D")
+    fl = go.Figure()
+
+    for i, c in enumerate(candidates):
+        segments = mesh_cut(
+            c["verts"], c["faces"], 0, xcut
+        )
+        color = colors[i % len(colors)]
+        for j, segment in enumerate(segments):
+            p, q = segment
+            fl.add_trace(go.Scatter(
+                x=[p[1], q[1]],
+                y=[p[2], q[2]],
+                mode="lines",
+                line=dict(color=color, width=3),
+                name=c["name"],
+                showlegend=j == 0
+            ))
+
+    fl.update_layout(
+        height=480,
+        xaxis_title="Y (m)",
+        yaxis_title="Z (m)"
+    )
+    st.plotly_chart(fl, use_container_width=True)
+
     st.caption(
-        "Pernos, cables, malla y gunita esquemáticos. "
-        "No se calcula interacción con cuñas ni FS. "
-        "No se sostiene el piso."
+        "Ambos cortes proceden de las mallas 3D representadas. "
+        "La gunita y los anclajes son esquemáticos; "
+        "no se comprueba su interacción resistente."
     )
 
 
-with t_dxf:
-    payload = {
-        "galeria": dict(
-            ancho=W,
-            alto=H,
-            longitud=L,
-            azimut=az,
-            pendiente=slope
-        ),
+with tab4:
+    data = {
+        "version": "10",
+        "galeria": {
+            "ancho": W,
+            "alto": H,
+            "longitud": L,
+            "azimut": az,
+            "pendiente": slope
+        },
         "discontinuidades": systems
     }
 
     st.download_button(
         "Descargar datos JSON",
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            indent=2
-        ),
-        file_name="geotecnia_mina_datos.json",
+        json.dumps(data, indent=2, ensure_ascii=False),
+        file_name="geotecnia_mina_v10.json",
         mime="application/json"
     )
 
     if dxf is not None:
         try:
             import ezdxf
-
             doc = ezdxf.read(
                 io.StringIO(
                     dxf.getvalue().decode(
@@ -972,9 +796,8 @@ with t_dxf:
                     )
                 )
             )
-
-            figd = go.Figure()
-            n = 0
+            fd = go.Figure()
+            count = 0
 
             for ent in doc.modelspace():
                 typ = ent.dxftype()
@@ -989,44 +812,40 @@ with t_dxf:
                     pts = list(ent.get_points("xy"))
                 elif typ == "POLYLINE":
                     pts = [
-                        vert.dxf.location[:2]
-                        for vert in ent.vertices
+                        p.dxf.location[:2]
+                        for p in ent.vertices
                     ]
                 elif typ in ("CIRCLE", "ARC"):
-                    cen = ent.dxf.center
-                    rad = ent.dxf.radius
-
+                    center = ent.dxf.center
+                    radius = ent.dxf.radius
                     if typ == "CIRCLE":
-                        angles = np.linspace(
-                            0, 2 * np.pi, 120
+                        ang = np.linspace(
+                            0, 2*np.pi, 120
                         )
                     else:
-                        start = ent.dxf.start_angle
-                        end = ent.dxf.end_angle
-                        angles = np.deg2rad(
-                            np.linspace(
-                                start,
-                                end if end >= start else end + 360,
-                                120
-                            )
+                        a0 = ent.dxf.start_angle
+                        a1 = ent.dxf.end_angle
+                        if a1 < a0:
+                            a1 += 360
+                        ang = np.deg2rad(
+                            np.linspace(a0, a1, 120)
                         )
-
                     pts = np.column_stack((
-                        cen.x + rad * np.cos(angles),
-                        cen.y + rad * np.sin(angles)
+                        center.x+radius*np.cos(ang),
+                        center.y+radius*np.sin(ang)
                     ))
 
                 if pts is not None:
                     p = np.array(pts, dtype=float)
-                    figd.add_trace(go.Scatter(
+                    fd.add_trace(go.Scatter(
                         x=p[:, 0],
                         y=p[:, 1],
                         mode="lines",
                         showlegend=False
                     ))
-                    n += 1
+                    count += 1
 
-            figd.update_layout(
+            fd.update_layout(
                 height=550,
                 xaxis=dict(
                     title="X DXF",
@@ -1035,20 +854,14 @@ with t_dxf:
                 ),
                 yaxis_title="Y DXF"
             )
-            st.plotly_chart(
-                figd,
-                use_container_width=True
-            )
+            st.plotly_chart(fd, use_container_width=True)
             st.caption(
-                f"{n} entidades representadas. "
-                "El DXF no modifica las cuñas."
+                f"{count} entidades DXF representadas. "
+                "El DXF no modifica la geometría calculada."
             )
         except Exception as exc:
-            st.error(
-                f"No se ha podido leer el DXF: {exc}"
-            )
+            st.error(f"Error leyendo DXF: {exc}")
     else:
         st.info(
-            "Sube un DXF en el panel lateral "
-            "para visualizar la sección."
+            "Puedes subir un DXF desde el panel lateral."
         )
