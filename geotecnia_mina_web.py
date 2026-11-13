@@ -5,8 +5,8 @@ import streamlit as st
 import plotly.graph_objects as go
 from scipy.spatial import ConvexHull
 
-st.set_page_config(page_title='Geotecnia Mina v5', layout='wide')
-st.title('Geotecnia Mina · v5')
+st.set_page_config(page_title='Geotecnia Mina v6', layout='wide')
+st.title('Geotecnia Mina · v6')
 st.caption('Discontinuidades · cuñas geométricas aproximadas · sostenimiento 2D')
 st.warning('PROTOTIPO DE INVESTIGACIÓN. Las cuñas se calculan contra un PLANO TANGENTE HORIZONTAL en la clave, NO contra la bóveda curva real. No se calcula FS 3D ni se dimensiona sostenimiento. No utilizar para decisiones de seguridad.')
 
@@ -29,7 +29,7 @@ section=np.vstack([[-r,0],[-r,spring], np.column_stack((r*np.cos(np.linspace(np.
 
 systems=[]
 methods=['Mohr-Coulomb (junta)','Barton-Bandis (junta)','Patton (junta)','Hoek-Brown (macizo; no junta)']
-tab_data,tab_wedge,tab_support,tab_info=st.tabs(['Discontinuidades','Cuñas 3D','Sostenimiento 2D','Datos / DXF'])
+tab_data,tab_wedge,tab_support,tab_info=st.tabs(['Discontinuidades','Cuñas 3D + cortes 2D','Sostenimiento 2D','Datos / DXF'])
 with tab_data:
     st.write('Abre solo el sistema que quieras editar. Cada plano se define por su orientación y por un punto de paso en coordenadas locales de la galería.')
     for i in range(3):
@@ -126,8 +126,44 @@ with tab_wedge:
         c3.metric('FS 3D','No calculado')
     else:
         st.info('No se ha identificado una cuña cerrada de techo con los datos actuales: '+error)
-    fig.update_layout(height=660,margin=dict(l=0,r=0,t=5,b=0),scene=dict(xaxis_title='Transversal X (m)',yaxis_title='Eje Y (m)',zaxis_title='Altura Z (m)',aspectmode='data',camera=dict(eye=dict(x=1.6,y=-1.4,z=1.2))),legend=dict(orientation='h'))
+    # Show the geometry at a useful size, with a short local segment around the candidate.
+    if result:
+        center=np.mean(result[0],axis=0)
+        ext=max(4.,float(np.max(np.ptp(result[0],axis=0)))*1.8)
+    else:
+        center=np.array([0.,L/2,H/2]); ext=max(W,H,5.)*1.5
+    fig.update_layout(height=740,margin=dict(l=0,r=0,t=10,b=0),scene=dict(
+        xaxis=dict(title='X transversal (m)',range=[center[0]-ext/2,center[0]+ext/2]),
+        yaxis=dict(title='Y eje (m)',range=[center[1]-ext/2,center[1]+ext/2]),
+        zaxis=dict(title='Z altura (m)',range=[center[2]-ext/2,center[2]+ext/2]),
+        aspectmode='cube',camera=dict(eye=dict(x=1.5,y=-1.8,z=1.35))),legend=dict(orientation='h'))
     st.plotly_chart(fig,use_container_width=True)
+    st.subheader('Cortes 2D de las discontinuidades')
+    st.caption('Trazas matemáticas de planos infinitos. No equivalen a polígonos cerrados ni prueban que exista una cuña desprendible.')
+    section_y=st.slider('Posición del corte transversal Y (m)',0.,float(L),float(L/2),step=0.1)
+    fig_cross=go.Figure()
+    fig_cross.add_trace(go.Scatter(x=section[:,0],y=section[:,1],mode='lines',line=dict(color='#334155',width=5),name='Galería'))
+    xx=np.linspace(-W*1.2,W*1.2,160)
+    for idx,sys in enumerate(systems):
+        n=plane_normal(sys); p=np.array([sys['xoff'],sys['offset'],H]); rhs=float(n@p)
+        if abs(n[2])>1e-7:
+            zz=(rhs-n[0]*xx-n[1]*section_y)/n[2]
+            fig_cross.add_trace(go.Scatter(x=xx,y=zz,mode='lines',name=f'Sistema {idx+1}',line=dict(width=3,dash='dash')))
+        else:
+            xconst=(rhs-n[1]*section_y)/n[0] if abs(n[0])>1e-7 else None
+            if xconst is not None:fig_cross.add_vline(x=xconst,line_dash='dash')
+    fig_cross.update_layout(height=440,xaxis=dict(title='X (m)',range=[-W*1.2,W*1.2],scaleanchor='y',scaleratio=1),yaxis=dict(title='Z (m)',range=[-H*.4,H*1.7]),margin=dict(l=0,r=0,t=10,b=0))
+    st.plotly_chart(fig_cross,use_container_width=True)
+    fig_long=go.Figure()
+    yy=np.linspace(0,L,200)
+    for idx,sys in enumerate(systems):
+        n=plane_normal(sys);p=np.array([sys['xoff'],sys['offset'],H]);rhs=float(n@p)
+        if abs(n[2])>1e-7:
+            zz=(rhs-n[1]*yy)/n[2]
+            fig_long.add_trace(go.Scatter(x=yy,y=zz,mode='lines',name=f'Sistema {idx+1}',line=dict(dash='dash')))
+    fig_long.add_hline(y=H,line_color='#64748b',annotation_text='Plano tangente en clave')
+    fig_long.update_layout(height=330,xaxis_title='Y longitudinal (m)',yaxis=dict(title='Z (m)',range=[-H*.4,H*2]),margin=dict(l=0,r=0,t=5,b=0))
+    st.plotly_chart(fig_long,use_container_width=True)
 
 supports={
 'ST-I':(2.0,2.0,0.03,0,0),
@@ -139,6 +175,7 @@ supports={
 with tab_support:
     st.subheader('Sección transversal 2D · disposición esquemática')
     preset=st.selectbox('Tipo de sostenimiento',list(supports))
+    bolt_type=st.selectbox('Tipo de perno', ['Resina (barra corrugada)','Split Set (fricción)','Swellex (expansivo)','Sin pernos'])
     dx,dy,shot,cable,cs=supports[preset]
     with st.expander('Modificar elementos del sostenimiento',expanded=(preset=='Personalizado')):
         boltlen=st.number_input('Longitud pernos (m)',0.5,10.,2.4)
@@ -157,22 +194,23 @@ with tab_support:
         fig2.add_trace(go.Scatter(x=section[1:-1,0],y=section[1:-1,1],mode='lines',line=dict(color='#16a34a',width=2,dash='dot'),name='Malla (esquemática)'))
     perimeter=np.vstack([[-r,spring],np.column_stack((r*np.cos(np.linspace(np.pi,0,120)),spring+r*np.sin(np.linspace(np.pi,0,120)))),[r,spring]])
     seg=np.linalg.norm(np.diff(perimeter,axis=0),axis=1); cum=np.r_[0,np.cumsum(seg)]
-    positions=np.arange(spacing/2,cum[-1],spacing)
+    positions=np.arange(spacing/2,cum[-1],spacing) if bolt_type!='Sin pernos' else []
     for k,s in enumerate(positions):
         idx=np.searchsorted(cum,s)-1; idx=max(0,min(idx,len(seg)-1)); t=(s-cum[idx])/max(seg[idx],1e-9)
         p=perimeter[idx]*(1-t)+perimeter[idx+1]*t
         normal=np.array([p[0],p[1]-spring]); normal=normal/max(np.linalg.norm(normal),1e-8)
         q=p+boltlen*normal
-        fig2.add_trace(go.Scatter(x=[p[0],q[0]],y=[p[1],q[1]],mode='lines+markers',line=dict(color='#2563eb',width=4),marker=dict(size=4),name='Pernos 2.4 m' if k==0 else None,showlegend=(k==0)))
+        fig2.add_trace(go.Scatter(x=[p[0],q[0]],y=[p[1],q[1]],mode='lines+markers',line=dict(color='#2563eb',width=4),marker=dict(size=4),name=f'{bolt_type} · {boltlen:g} m' if k==0 else None,showlegend=(k==0)))
     if cable>0:
         for k,angle in enumerate((math.pi*.30,math.pi*.5,math.pi*.70)):
             p=np.array([r*math.cos(angle),spring+r*math.sin(angle)])
             n=np.array([math.cos(angle),math.sin(angle)])
             q=p+cable*n
             fig2.add_trace(go.Scatter(x=[p[0],q[0]],y=[p[1],q[1]],mode='lines',line=dict(color='#a855f7',width=5),name='Cables (esquemáticos)' if k==0 else None,showlegend=k==0))
-    fig2.update_layout(height=580,xaxis=dict(title='Ancho (m)',scaleanchor='y',scaleratio=1),yaxis=dict(title='Altura (m)'),margin=dict(l=10,r=10,t=10,b=10),legend=dict(orientation='h'))
+    fig2.update_layout(height=700,xaxis=dict(title='Ancho (m)',scaleanchor='y',scaleratio=1),yaxis=dict(title='Altura (m)'),margin=dict(l=10,r=10,t=10,b=10),legend=dict(orientation='h'))
     st.plotly_chart(fig2,use_container_width=True)
     st.caption('Representación esquemática de disposición transversal; no comprueba anclajes, capacidades, espaciamiento longitudinal ni FS. El piso no lleva sostenimiento.')
+    st.info(f'Pernos: {bolt_type}. Capacidad nominal introducida: {boltcap:g} kN. Esta capacidad NO es la fuerza movilizable frente a una cuña.')
 
 with tab_info:
     st.subheader('Resumen de parámetros y DXF')
