@@ -1,14 +1,14 @@
-"""Geotecnia Mina Web v7 — visualizador geométrico educativo, NO software de diseño."""
+"""Geotecnia Mina Web v8 — visualizador geométrico educativo, NO software de diseño."""
 import io, json, math, itertools
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 from scipy.spatial import ConvexHull
 
-st.set_page_config(page_title='Geotecnia Mina v7',layout='wide')
-st.title('Geotecnia Mina · v7')
-st.caption('Cuñas 3D y cortes reales del tetraedro · sostenimiento 2D editable · DXF')
-st.warning('PROTOTIPO GEOMÉTRICO: techo representado por plano horizontal tangente, no por la bóveda curva. No calcula FS ni valida estabilidad o sostenimiento. No usar para dimensionamiento.')
+st.set_page_config(page_title='Geotecnia Mina v8',layout='wide')
+st.title('Geotecnia Mina · v8')
+st.caption('Geometría dependiente de las discontinuidades · cortes 2D vinculados · sostenimiento superpuesto · DXF')
+st.warning('PROTOTIPO GEOMÉTRICO: las cuñas candidatas se obtienen de tres planos y un techo horizontal tangente, NO de la bóveda curva. Si no hay cierre geométrico no se dibuja cuña. No calcula FS ni valida sostenimiento. NO usar para dimensionamiento.')
 
 with st.sidebar:
     st.header('Galería')
@@ -115,7 +115,7 @@ def slice_polygon(vertices,axis,value):
 
 with t_wedge:
     st.subheader('Cuñas geométricas · vista 3D y secciones')
-    mode=st.radio('Origen de la geometría', ['Ejemplo cerrado para comprobar el visor','Tres discontinuidades introducidas'],horizontal=True)
+    mode=st.radio('Origen de la geometría', ['Tres discontinuidades introducidas','Ejemplo cerrado para comprobar el visor'],horizontal=True, key='modo_cuna')
     if mode.startswith('Ejemplo'):
         v,hull,warning=demo_tetra(); error=None
         st.info('El ejemplo es un tetraedro matemáticamente cerrado, útil para comprobar el 3D y los cortes 2D. NO representa una cuña medida en la mina.')
@@ -142,12 +142,12 @@ with t_wedge:
     else:
         st.info('No se ha formado una cuña tetraédrica candidata: '+str(error))
         center=np.array([0,L/2,H/2]);extent=max(W,H,6.)*2
-    fig.update_layout(height=650,margin=dict(l=0,r=0,t=0,b=0),scene=dict(
+    fig.update_layout(height=750,margin=dict(l=0,r=0,t=0,b=0),scene=dict(
         xaxis=dict(title='X (m)',range=[center[0]-extent/2,center[0]+extent/2]),
         yaxis=dict(title='Y (m)',range=[center[1]-extent/2,center[1]+extent/2]),
         zaxis=dict(title='Z (m)',range=[max(0,center[2]-extent/2),center[2]+extent/2]),
-        aspectmode='cube',camera=dict(eye=dict(x=1.7,y=-1.6,z=1.15))))
-    st.plotly_chart(fig,use_container_width=True)
+        aspectmode='cube',camera=dict(eye=dict(x=1.35,y=-1.35,z=.95)), bgcolor='rgba(0,0,0,0)'))
+    st.plotly_chart(fig,use_container_width=True, config={'scrollZoom': True})
     st.subheader('Cortes 2D del mismo bloque 3D')
     a,b=st.columns(2)
     with a:
@@ -180,7 +180,8 @@ presets={
     'ST-IV profundo':(1.5,1.5,.15,10.,1.,True),
     'Personalizado':(1.5,1.5,.08,0.,1.5,True)}
 with t_support:
-    st.subheader('Sostenimiento transversal 2D')
+    st.subheader('Sostenimiento transversal 2D con cuña superpuesta')
+    st.caption('El corte de cuña utiliza el MISMO bloque calculado en la pestaña 3D. Cambia al modo de tres discontinuidades para que responda a sus orientaciones.')
     c1,c2=st.columns(2)
     with c1:
         preset=st.selectbox('Sostenimiento tipo',list(presets))
@@ -216,7 +217,21 @@ with t_support:
         with st.expander('Malla · propiedades',expanded=False):
             mesh_type=st.text_input('Tipo de malla','Electrosoldada / metálica')
             mesh_overlap=st.number_input('Solape (%)',0.,50.,10.)
+    # La geometría se comparte con la pestaña de cuñas; no se crea un bloque independiente.
+    st.markdown('**Cuña y sostenimiento en la misma sección**')
+    cut_support=st.slider('Posición del corte transversal (Y, m)',0.,float(L),float(L/2),.1,key='corte_sostenimiento')
+    show_wedge=st.checkbox('Mostrar cuña en sección de sostenimiento',value=True)
     f=go.Figure()
+    if show_wedge and v is not None:
+        cutpoly=slice_polygon(v,1,cut_support)
+        if cutpoly is not None:
+            f.add_trace(go.Scatter(x=np.r_[cutpoly[:,0],cutpoly[0,0]],y=np.r_[cutpoly[:,2],cutpoly[0,2]],
+                mode='lines',fill='toself',fillcolor='rgba(234,88,12,0.38)',
+                line=dict(color='#c2410c',width=3),name='Cuña (corte del bloque 3D)'))
+        else:
+            st.info('El plano de corte seleccionado no atraviesa el bloque. Desplaza el control Y.')
+    elif show_wedge:
+        st.warning('No hay cuña candidata cerrada con los datos actuales. Consulta el diagnóstico de Cuñas 3D; no se dibuja una cuña ficticia.')
     f.add_trace(go.Scatter(x=section[:,0],y=section[:,1],mode='lines',line=dict(color='#334155',width=5),name='Excavación'))
     if shot_cm>0:
         # Trazo representativo: el espesor gráfico NO es una equidistancia exacta.
@@ -242,7 +257,7 @@ with t_support:
             f.add_trace(go.Scatter(x=[p[0],q[0]],y=[p[1],q[1]],mode='lines',line=dict(color='#9333ea',width=5),name='Cables' if k==0 else None,showlegend=k==0))
     f.update_layout(height=650,xaxis=dict(title='X (m)',scaleanchor='y',scaleratio=1),yaxis_title='Z (m)',margin=dict(l=0,r=0,t=5,b=0),legend=dict(orientation='h'))
     st.plotly_chart(f,use_container_width=True)
-    st.caption('Distribución transversal esquemática; no verifica capacidades, longitud de anclaje, separación longitudinal ni efecto estructural de gunita. No se sostiene el piso.')
+    st.caption('Cuña: corte geométrico del mismo tetraedro del visor 3D (si existe). Pernos, cables, malla y gunita: disposición esquemática. No verifica interacción anclaje-cuñas, capacidad, FS ni bóveda curva. No se sostiene el piso.')
 
 with t_dxf:
     payload={'galeria':dict(ancho=W,alto=H,longitud=L,azimut=az,pendiente=slope),'discontinuidades':systems}
