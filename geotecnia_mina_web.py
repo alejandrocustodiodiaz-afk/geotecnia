@@ -1,84 +1,57 @@
 
-"""Geotecnia Mina Web v11 - visualizador preliminar de cuñas."""
 import io
 import json
 import math
-import itertools
 
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.spatial import ConvexHull
+from scipy import ndimage as ndi
 from skimage.measure import marching_cubes
 
-st.set_page_config(
-    page_title="Geotecnia Mina v11",
-    layout="wide"
-)
-
-st.title("Geotecnia Mina · v11")
-st.caption(
-    "Cuñas de bóveda y hastiales · filtros de revisión · "
-    "cortes 2D y 3D · sostenimiento"
-)
+st.set_page_config(page_title="Geotecnia Mina v12", layout="wide")
+st.title("Geotecnia Mina · v12")
+st.caption("Bloques de bóveda y hastiales · Modelo 3D y cortes 2D")
 st.warning(
-    "MODELO GEOMÉTRICO PRELIMINAR. Los bloques se generan "
-    "mediante combinaciones simplificadas de tres planos. "
-    "No se verifica liberación cinemática, equilibrio límite, "
-    "persistencia real ni FS. No utilizar para dimensionamiento."
+    "PROTOTIPO GEOMÉTRICO. Los bloques se obtienen mediante "
+    "discretización espacial y planos continuos. No se verifica "
+    "persistencia real, liberación cinemática ni factor de seguridad. "
+    "No utilizar para dimensionamiento."
 )
 
 with st.sidebar:
-    st.header("Geometría de galería")
+    st.header("Geometría de la galería")
     W = st.number_input("Ancho (m)", 1.0, 25.0, 5.8, 0.1)
     H = st.number_input("Altura (m)", 1.0, 25.0, 5.8, 0.1)
-    L = st.number_input("Longitud (m)", 2.0, 100.0, 15.0, 0.5)
-    az = st.number_input("Azimut eje (°)", 0.0, 359.9, 0.0)
-    slope = st.number_input("Pendiente eje (°)", -45.0, 45.0, 0.0)
+    L = st.number_input("Longitud (m)", 3.0, 60.0, 15.0, 0.5)
+    az = st.number_input("Azimut del eje (°)", 0.0, 359.9, 0.0)
     gamma = st.number_input(
         "Peso específico (kN/m³)", 10.0, 40.0, 26.4, 0.1
     )
 
     st.divider()
-    st.header("Visualización de cuñas")
-
-    mode = st.radio(
-        "Modo de revisión",
-        ["Revisión de seguridad", "Vista simplificada"],
-        index=0
+    st.header("Control de cuñas")
+    view = st.radio(
+        "Modo de visualización",
+        ["Revisión de seguridad", "Vista simplificada"]
     )
-
-    min_volume = st.number_input(
-        "Volumen mínimo orientativo (m³)",
-        0.0, 100.0, 0.25, 0.05
+    nplanes = st.slider("Planos por familia", 1, 5, 3)
+    resolution = st.slider("Resolución del cálculo", 35, 75, 55, 5)
+    minvol = st.number_input(
+        "Volumen mínimo visual (m³)", 0.0, 100.0, 0.25, 0.05
     )
-
-    nplanes = st.slider(
-        "Planos por familia", 1, 5, 3
+    show_all = st.checkbox(
+        "Mostrar también bloques pequeños", value=True
     )
-
-    max_zone = st.slider(
-        "Máximo por zona en vista simplificada",
-        1, 10, 3
+    show_open = st.checkbox(
+        "Mostrar bloques abiertos en el límite del modelo",
+        value=True
     )
-
-    show_small = st.checkbox(
-        "Mostrar también candidatos menores al umbral",
-        value=False
+    maxzone = st.slider(
+        "Máximo por zona en vista simplificada", 1, 8, 3
     )
-
-    only_persistent = st.checkbox(
-        "Filtrar por persistencia simplificada",
-        value=False,
-        help=(
-            "Esta comprobación no sustituye una evaluación "
-            "de la geometría real de las discontinuidades."
-        )
-    )
-
     dxf = st.file_uploader(
-        "Sección AutoCAD DXF",
-        type=["dxf"]
+        "Sección AutoCAD DXF", type=["dxf"]
     )
 
 r = W / 2
@@ -95,28 +68,25 @@ section = np.vstack((
     [r, 0]
 ))
 
-methods = [
-    "Mohr-Coulomb",
-    "Barton-Bandis",
-    "Patton",
-    "Hoek-Brown (macizo)"
-]
-
-tab1, tab2, tab3, tab4 = st.tabs([
+t1, t2, t3, t4 = st.tabs([
     "Discontinuidades",
-    "Cuñas 3D",
+    "Bloques 3D",
     "Cortes y sostenimiento",
     "Datos y DXF"
 ])
 
 systems = []
 
-with tab1:
-    st.subheader("Familias de discontinuidades")
+with t1:
+    st.info(
+        "Las familias generan planos sucesivos según su "
+        "espaciamiento. La persistencia se registra, pero "
+        "todavía no limita geométricamente los planos."
+    )
+
     for i in range(3):
         with st.expander(
-            f"Familia {i + 1}",
-            expanded=i == 0
+            f"Familia {i + 1}", expanded=i == 0
         ):
             a, b = st.columns(2)
 
@@ -127,21 +97,21 @@ with tab1:
                     [30.0, 150.0, 270.0][i],
                     key=f"dd{i}"
                 )
-                dp = st.number_input(
+                dip = st.number_input(
                     "Buzamiento (°)",
                     0.0, 90.0, 60.0,
-                    key=f"dp{i}"
+                    key=f"dip{i}"
                 )
-                off = st.number_input(
-                    "Posición longitudinal (m)",
+                posy = st.number_input(
+                    "Posición longitudinal Y (m)",
                     0.0, L,
                     L * [0.42, 0.50, 0.58][i],
-                    key=f"off{i}"
+                    key=f"y{i}"
                 )
-                xo = st.number_input(
-                    "Posición transversal (m)",
+                posx = st.number_input(
+                    "Posición transversal X (m)",
                     -W, W, 0.0,
-                    key=f"xo{i}"
+                    key=f"x{i}"
                 )
                 spacing = st.number_input(
                     "Espaciamiento (m)",
@@ -157,74 +127,69 @@ with tab1:
             with b:
                 method = st.selectbox(
                     "Criterio resistente",
-                    methods,
-                    key=f"method{i}"
+                    [
+                        "Mohr-Coulomb",
+                        "Barton-Bandis",
+                        "Patton"
+                    ],
+                    key=f"m{i}"
                 )
-                props = {}
 
                 if method == "Mohr-Coulomb":
-                    props["cohesion_MPa"] = st.number_input(
-                        "Cohesión (MPa)",
-                        0.0, 20.0, 0.05,
-                        key=f"c{i}"
-                    )
-                    props["friccion_deg"] = st.number_input(
-                        "Fricción (°)",
-                        0.0, 89.0, 30.0,
-                        key=f"phi{i}"
-                    )
+                    props = {
+                        "c_MPa": st.number_input(
+                            "Cohesión (MPa)",
+                            0.0, 20.0, 0.05,
+                            key=f"c{i}"
+                        ),
+                        "phi": st.number_input(
+                            "Fricción (°)",
+                            0.0, 89.0, 30.0,
+                            key=f"ph{i}"
+                        )
+                    }
                 elif method == "Barton-Bandis":
-                    props["JRC"] = st.number_input(
-                        "JRC", 0.0, 25.0, 10.0,
-                        key=f"jrc{i}"
-                    )
-                    props["JCS_MPa"] = st.number_input(
-                        "JCS (MPa)",
-                        0.1, 500.0, 30.0,
-                        key=f"jcs{i}"
-                    )
-                    props["phi_residual"] = st.number_input(
-                        "Fricción residual (°)",
-                        0.0, 89.0, 25.0,
-                        key=f"pr{i}"
-                    )
-                elif method == "Patton":
-                    props["phi_basica"] = st.number_input(
-                        "Fricción básica (°)",
-                        0.0, 89.0, 25.0,
-                        key=f"pb{i}"
-                    )
-                    props["asperidad"] = st.number_input(
-                        "Ángulo asperidades (°)",
-                        0.0, 60.0, 10.0,
-                        key=f"as{i}"
-                    )
+                    props = {
+                        "JRC": st.number_input(
+                            "JRC", 0.0, 25.0, 10.0,
+                            key=f"jrc{i}"
+                        ),
+                        "JCS_MPa": st.number_input(
+                            "JCS (MPa)",
+                            0.1, 500.0, 30.0,
+                            key=f"jcs{i}"
+                        ),
+                        "phi_r": st.number_input(
+                            "Fricción residual (°)",
+                            0.0, 89.0, 25.0,
+                            key=f"pr{i}"
+                        )
+                    }
                 else:
-                    props["UCS_MPa"] = st.number_input(
-                        "UCS (MPa)",
-                        0.1, 500.0, 52.6,
-                        key=f"ucs{i}"
-                    )
-                    props["GSI"] = st.number_input(
-                        "GSI", 1.0, 100.0, 50.0,
-                        key=f"gsi{i}"
-                    )
-                    st.info(
-                        "Hoek-Brown es un criterio de macizo, "
-                        "no de resistencia de juntas."
-                    )
+                    props = {
+                        "phi_b": st.number_input(
+                            "Fricción básica (°)",
+                            0.0, 89.0, 25.0,
+                            key=f"pb{i}"
+                        ),
+                        "asperidad": st.number_input(
+                            "Asperidad (°)",
+                            0.0, 60.0, 10.0,
+                            key=f"as{i}"
+                        )
+                    }
 
                 props["agua_MPa"] = st.number_input(
                     "Presión de agua (MPa)",
                     0.0, 10.0, 0.0,
-                    key=f"water{i}"
+                    key=f"w{i}"
                 )
 
             systems.append(dict(
                 dd=dd,
-                dp=dp,
-                off=off,
-                xo=xo,
+                dip=dip,
+                y=posy,
+                x=posx,
                 spacing=spacing,
                 persistence=persistence,
                 method=method,
@@ -232,320 +197,222 @@ with tab1:
             ))
 
 
-def normal(s):
-    theta = np.deg2rad(s["dd"] - az)
-    dip = np.deg2rad(s["dp"])
-    return np.array([
-        np.sin(theta) * np.sin(dip),
-        np.cos(theta) * np.sin(dip),
-        np.cos(dip)
-    ])
-
-
-def generate_planes():
-    families = []
-    for s in systems:
-        n = normal(s)
-        p = np.array([s["xo"], s["off"], H])
-        base = n @ p
-        family = []
-        for k in range(nplanes):
-            shift = (
-                k - (nplanes - 1) / 2
-            ) * s["spacing"]
-            family.append((
-                n, base + shift, s["persistence"]
-            ))
-        families.append(family)
-    return families
-
-
-def make_tetra(planes, zone):
-    ns = np.array([p[0] for p in planes])
-    rhs = np.array([p[1] for p in planes])
-
-    if abs(np.linalg.det(ns)) < 1e-8:
-        return None
-
-    apex = np.linalg.solve(ns, rhs)
-
-    if zone == "Bóveda":
-        axis = 2
-        value = spring
-        if apex[2] <= H:
-            return None
-        if abs(apex[0]) > r * 1.6:
-            return None
-    elif zone == "Hastial izquierdo":
-        axis = 0
-        value = 0.0
-        if apex[0] >= -r:
-            return None
-        if apex[2] < -1 or apex[2] > H + 1:
-            return None
-    else:
-        axis = 0
-        value = 0.0
-        if apex[0] <= r:
-            return None
-        if apex[2] < -1 or apex[2] > H + 1:
-            return None
-
-    vertices = [apex]
-
-    for i, j in [(0, 1), (0, 2), (1, 2)]:
-        mat = np.array([
-            ns[i],
-            ns[j],
-            np.eye(3)[axis]
-        ])
-        if abs(np.linalg.det(mat)) < 1e-8:
-            return None
-
-        vertices.append(
-            np.linalg.solve(
-                mat, [rhs[i], rhs[j], value]
-            )
-        )
-
-    vertices = np.array(vertices)
-
-    if not np.isfinite(vertices).all():
-        return None
-
-    if (
-        vertices[:, 1].max() < 0
-        or vertices[:, 1].min() > L
-    ):
-        return None
-
-    try:
-        hull = ConvexHull(vertices)
-    except Exception:
-        return None
-
-    if hull.volume < 1e-7:
-        return None
-
-    edge = max(
-        np.linalg.norm(vertices[i] - vertices[j])
-        for i, j in itertools.combinations(range(4), 2)
-    )
-
-    persistence_ok = all(
-        edge <= p[2] for p in planes
-    )
-
-    return vertices, edge, persistence_ok
-
-
 @st.cache_data(show_spinner=False)
-def clip_mesh(vtuple, zone, width, height, length):
-    """Recorte numérico aproximado, no operación CAD exacta."""
-    v = np.array(vtuple, dtype=float)
+def calculate(width, height, length, azimuth, specs, n, res):
     rr = width / 2
     ss = height - rr
+    margin = max(2.5, width * 0.65)
 
-    try:
-        hull = ConvexHull(v)
-    except Exception:
-        return None
-
-    lo = np.maximum(
-        v.min(axis=0) - .1,
-        [-width*2, 0.0, -.1]
+    nx = res
+    ny = max(
+        35, int(res * length / (width + 2 * margin))
     )
-    hi = np.minimum(
-        v.max(axis=0) + .1,
-        [width*2, length, height+width*2]
+    nz = max(
+        35, int(res * (height + margin) / (width + 2 * margin))
     )
 
-    if np.any(hi-lo < .05):
-        return None
+    nx = min(nx, 75)
+    ny = min(ny, 110)
+    nz = min(nz, 85)
 
-    size = hi-lo
-    dims = np.maximum(
-        20,
-        np.minimum(
-            60,
-            np.ceil(42*size/max(size)).astype(int)
+    xx = np.linspace(-rr - margin, rr + margin, nx)
+    yy = np.linspace(0, length, ny)
+    zz = np.linspace(0, height + margin, nz)
+
+    dx = xx[1] - xx[0]
+    dy = yy[1] - yy[0]
+    dz = zz[1] - zz[0]
+
+    X, Y, Z = np.meshgrid(
+        xx, yy, zz, indexing="ij"
+    )
+
+    inside = (
+        (np.abs(X) < rr)
+        & (
+            (Z < ss)
+            | (
+                (X * X + (Z - ss) ** 2 < rr * rr)
+                & (Z >= ss)
+            )
         )
     )
 
-    axes = [
-        np.linspace(lo[i], hi[i], int(dims[i]))
-        for i in range(3)
-    ]
+    rock = ~inside
+    signature = np.zeros(X.shape, dtype=np.uint32)
+    bit = 0
 
-    X, Y, Z = np.meshgrid(*axes, indexing="ij")
+    for s in specs:
+        theta = np.deg2rad(s["dd"] - azimuth)
+        dip = np.deg2rad(s["dip"])
 
-    signed = np.maximum.reduce([
-        e[0]*X + e[1]*Y + e[2]*Z + e[3]
-        for e in hull.equations
-    ])
-
-    if zone == "Bóveda":
-        roof = ss + np.sqrt(
-            np.maximum(0, rr*rr-X*X)
-        )
-        boundary = np.maximum(
-            roof-Z, np.abs(X)-rr
-        )
-    elif zone == "Hastial derecho":
-        boundary = np.maximum.reduce([
-            rr-X, -Z, Z-ss
-        ])
-    else:
-        boundary = np.maximum.reduce([
-            X+rr, -Z, Z-ss
+        normal = np.array([
+            np.sin(theta) * np.sin(dip),
+            np.cos(theta) * np.sin(dip),
+            np.cos(dip)
         ])
 
-    field = np.maximum(signed, boundary)
-    field = np.maximum(field, -Y)
-    field = np.maximum(field, Y-length)
+        origin = np.array([
+            s["x"], s["y"], height
+        ])
 
-    if field.min() >= 0 or field.max() <= 0:
-        return None
+        base = float(normal @ origin)
 
-    step = np.array([
-        a[1]-a[0] for a in axes
-    ])
+        for k in range(n):
+            shift = (
+                k - (n - 1) / 2
+            ) * s["spacing"]
 
-    try:
-        verts, faces, _, _ = marching_cubes(
-            field.astype(np.float32),
-            level=0,
-            spacing=tuple(step)
-        )
-    except Exception:
-        return None
-
-    verts += lo
-
-    volume = float(
-        np.count_nonzero(field < 0)*np.prod(step)
-    )
-
-    if volume < .001:
-        return None
-
-    return verts, faces, volume
-
-
-def mesh_cut(vertices, faces, axis, value):
-    """Extrae segmentos del corte de una malla 3D."""
-    segments = []
-
-    for tri in faces:
-        pts = vertices[tri]
-        d = pts[:, axis]-value
-        intersections = []
-
-        for i, j in [(0, 1), (1, 2), (2, 0)]:
-            a, b = d[i], d[j]
-
-            if a*b < 0:
-                t = -a/(b-a)
-                intersections.append(
-                    pts[i]+t*(pts[j]-pts[i])
-                )
-
-        if len(intersections) == 2:
-            segments.append(intersections)
-
-    return segments
-
-
-def find_candidates():
-    families = generate_planes()
-    found = []
-
-    for indices in itertools.product(
-        range(nplanes), repeat=3
-    ):
-        planes = [
-            families[i][indices[i]]
-            for i in range(3)
-        ]
-
-        for zone in [
-            "Bóveda",
-            "Hastial izquierdo",
-            "Hastial derecho"
-        ]:
-            result = make_tetra(planes, zone)
-
-            if result is None:
-                continue
-
-            v, edge, persistence_ok = result
-            mesh = clip_mesh(
-                tuple(map(tuple, v)),
-                zone, W, H, L
+            signed = (
+                normal[0] * X
+                + normal[1] * Y
+                + normal[2] * Z
+                - (base + shift)
             )
 
-            if mesh is None:
+            signature |= (
+                (signed >= 0).astype(np.uint32) << bit
+            )
+            bit += 1
+
+    contact = rock & ndi.binary_dilation(
+        inside, iterations=1
+    )
+
+    labels = np.zeros(rock.shape, dtype=np.int32)
+    blocks = []
+    nextid = 0
+
+    structure = ndi.generate_binary_structure(3, 1)
+
+    for sig in np.unique(signature[contact]):
+        mask = rock & (signature == sig)
+
+        components, count = ndi.label(
+            mask, structure=structure
+        )
+
+        touched = np.unique(components[contact])
+
+        for comp in touched:
+            if comp == 0:
                 continue
 
-            mv, mf, volume = mesh
+            region = components == comp
+            count_vox = int(np.count_nonzero(region))
 
-            found.append(dict(
-                zone=zone,
-                vertices=mv,
-                faces=mf,
-                volume=volume,
-                weight=volume*gamma,
-                center=mv.mean(axis=0),
-                edge=edge,
-                persistence_ok=persistence_ok,
-                indices=indices
-            ))
+            if count_vox < 5:
+                continue
 
-    return found
+            adj = region & ndi.binary_dilation(
+                inside, iterations=1
+            )
+
+            roof_zone = adj & (Z >= ss)
+            left_zone = (
+                adj & (X < 0) & (Z < ss)
+            )
+            right_zone = (
+                adj & (X >= 0) & (Z < ss)
+            )
+
+            contacts = {
+                "Bóveda": int(roof_zone.sum()),
+                "Hastial izquierdo": int(left_zone.sum()),
+                "Hastial derecho": int(right_zone.sum())
+            }
+
+            zone = max(contacts, key=contacts.get)
+
+            open_boundary = bool(
+                np.any(region[0])
+                or np.any(region[-1])
+                or np.any(region[:, 0])
+                or np.any(region[:, -1])
+                or np.any(region[:, :, 0])
+                or np.any(region[:, :, -1])
+            )
+
+            nextid += 1
+            labels[region] = nextid
+
+            indices = np.argwhere(region)
+
+            center = np.array([
+                xx[indices[:, 0]].mean(),
+                yy[indices[:, 1]].mean(),
+                zz[indices[:, 2]].mean()
+            ])
+
+            blocks.append({
+                "id": nextid,
+                "zone": zone,
+                "contacts": contacts,
+                "volume": count_vox * dx * dy * dz,
+                "center": center.tolist(),
+                "open": open_boundary,
+                "count": count_vox
+            })
+
+    return labels, blocks, (xx, yy, zz)
 
 
-def near_duplicate(a, b):
-    """Solo detecta candidatos casi coincidentes; no fusiona sólidos."""
-    if a["zone"] != b["zone"]:
-        return False
+specs = tuple(
+    (
+        s["dd"],
+        s["dip"],
+        s["x"],
+        s["y"],
+        s["spacing"]
+    )
+    for s in systems
+)
 
-    va = a["volume"]
-    vb = b["volume"]
+geometry_specs = tuple(
+    dict(
+        dd=a,
+        dip=b,
+        x=c,
+        y=d,
+        spacing=e
+    )
+    for a, b, c, d, e in specs
+)
 
-    if max(va, vb) <= 0:
-        return False
-
-    volume_difference = abs(va-vb)/max(va, vb)
-    center_distance = np.linalg.norm(
-        a["center"]-b["center"]
+with st.spinner(
+    "Calculando regiones y contactos con la excavación..."
+):
+    labels, all_blocks, axes = calculate(
+        W, H, L, az,
+        geometry_specs,
+        nplanes,
+        resolution
     )
 
-    scale = max(min(va, vb)**(1/3), .1)
+xx, yy, zz = axes
 
-    return (
-        volume_difference < .02
-        and center_distance < .05*scale
+step = (
+    xx[1] - xx[0],
+    yy[1] - yy[0],
+    zz[1] - zz[0]
+)
+
+blocks = [
+    b for b in all_blocks
+    if (
+        show_all or b["volume"] >= minvol
     )
-
-
-def filter_candidates(found):
-    ordered = sorted(
-        found,
-        key=lambda c: c["volume"],
-        reverse=True
+    and (
+        show_open or not b["open"]
     )
+]
 
-    # El filtro de coincidencia es heurístico.
-    # No acredita que los sólidos sean idénticos.
-    unique = []
+blocks.sort(
+    key=lambda b: b["volume"],
+    reverse=True
+)
 
-    for c in ordered:
-        if not any(
-            near_duplicate(c, other)
-            for other in unique
-        ):
-            unique.append(c)
-
+if view == "Vista simplificada":
     selected = []
 
     for zone in [
@@ -553,107 +420,99 @@ def filter_candidates(found):
         "Hastial izquierdo",
         "Hastial derecho"
     ]:
-        zone_items = [
-            c for c in unique
-            if c["zone"] == zone
-        ]
+        selected += [
+            b for b in blocks
+            if b["zone"] == zone
+        ][:maxzone]
 
-        if only_persistent:
-            zone_items = [
-                c for c in zone_items
-                if c["persistence_ok"]
-            ]
-
-        if not show_small:
-            zone_items = [
-                c for c in zone_items
-                if c["volume"] >= min_volume
-            ]
-
-        if mode == "Vista simplificada":
-            zone_items = zone_items[:max_zone]
-
-        selected.extend(zone_items)
-
-    return unique, selected
-
-
-with st.spinner("Calculando candidatos geométricos..."):
-    raw_candidates = find_candidates()
-
-unique_candidates, candidates = filter_candidates(
-    raw_candidates
-)
+    blocks = selected
 
 colors = [
-    "#ea580c", "#2563eb", "#16a34a",
-    "#9333ea", "#dc2626", "#0891b2",
-    "#ca8a04", "#db2777", "#4f46e5",
-    "#65a30d", "#0f766e", "#b45309"
+    "#e76f51",
+    "#2a9d8f",
+    "#457b9d",
+    "#9b5de5",
+    "#f4a261",
+    "#ef476f",
+    "#06d6a0",
+    "#118ab2",
+    "#b56576"
 ]
 
-for i, c in enumerate(candidates):
-    c["name"] = f"C{i+1}"
-    c["color"] = colors[i % len(colors)]
+for i, b in enumerate(blocks):
+    b["color"] = colors[i % len(colors)]
 
 
-with tab2:
-    st.subheader("Cuñas geométricas de bóveda y hastiales")
+def surface(block_id):
+    mask = (labels == block_id).astype(np.uint8)
+    padded = np.pad(mask, 1)
+
+    if padded.max() == 0:
+        return None
+
+    vertices, faces, _, _ = marching_cubes(
+        padded,
+        level=0.5,
+        spacing=step
+    )
+
+    vertices += np.array([
+        xx[0] - step[0],
+        yy[0] - step[1],
+        zz[0] - step[2]
+    ])
+
+    return vertices, faces
+
+
+with t2:
+    st.subheader(
+        "Bloques que contactan con bóveda y hastiales"
+    )
 
     a, b, c = st.columns(3)
+
     a.metric(
-        "Candidatos generados",
-        len(raw_candidates)
+        "Regiones identificadas",
+        len(all_blocks)
     )
     b.metric(
-        "Tras filtro de coincidencia",
-        len(unique_candidates)
+        "Regiones visibles",
+        len(blocks)
     )
     c.metric(
-        "Cuñas visibles",
-        len(candidates)
+        "Regiones abiertas",
+        sum(x["open"] for x in all_blocks)
     )
 
-    st.caption(
-        "El filtro de coincidencia es aproximado. "
-        "Puede agrupar candidatos distintos muy similares; "
-        "los resultados originales se conservan en el recuento."
-    )
-
-    if not show_small:
-        small_count = sum(
-            x["volume"] < min_volume
-            for x in unique_candidates
+    if any(b["open"] for b in blocks):
+        st.warning(
+            "Algunas regiones alcanzan el límite exterior "
+            "del dominio. Su volumen está truncado "
+            "artificialmente y no representa una cuña cerrada."
         )
-        if small_count:
-            st.warning(
-                f"{small_count} candidatos inferiores a "
-                f"{min_volume:.2f} m³ están ocultos por "
-                "el filtro visual. Esto NO significa "
-                "que sean seguros."
-            )
 
     fig = go.Figure()
 
-    for yy in [0, L]:
+    for y in [0, L]:
         fig.add_trace(go.Scatter3d(
             x=section[:, 0],
-            y=np.full(len(section), yy),
+            y=np.full(len(section), y),
             z=section[:, 1],
             mode="lines",
             line=dict(
-                color="#64748b",
-                width=5
+                color="#475569",
+                width=6
             ),
             name="Galería",
-            showlegend=yy == 0
+            showlegend=y == 0
         ))
 
-    for k in [0, 25, 50, 75, 100]:
+    for k in [0, 24, 48, 72, 96, 119]:
         fig.add_trace(go.Scatter3d(
-            x=[section[k, 0]]*2,
+            x=[section[k, 0]] * 2,
             y=[0, L],
-            z=[section[k, 1]]*2,
+            z=[section[k, 1]] * 2,
             mode="lines",
             line=dict(
                 color="#cbd5e1",
@@ -662,9 +521,13 @@ with tab2:
             showlegend=False
         ))
 
-    for item in candidates:
-        v = item["vertices"]
-        faces = item["faces"]
+    for block in blocks:
+        surf = surface(block["id"])
+
+        if surf is None:
+            continue
+
+        v, faces = surf
 
         fig.add_trace(go.Mesh3d(
             x=v[:, 0],
@@ -673,36 +536,44 @@ with tab2:
             i=faces[:, 0],
             j=faces[:, 1],
             k=faces[:, 2],
-            color=item["color"],
-            opacity=.72,
+            color=block["color"],
+            opacity=0.65,
             flatshading=True,
-            name=(
-                f'{item["name"]} · '
-                f'{item["zone"]}'
-            ),
+            name=f'B{block["id"]} · {block["zone"]}',
             hovertemplate=(
-                f'{item["name"]}<br>'
-                f'{item["zone"]}<br>'
-                f'Volumen: {item["volume"]:.3f} m³'
+                f'B{block["id"]}<br>'
+                f'{block["zone"]}<br>'
+                f'Volumen discretizado: '
+                f'{block["volume"]:.2f} m³<br>'
+                f'Abierto: '
+                f'{"Sí" if block["open"] else "No"}'
                 '<extra></extra>'
             )
         ))
 
     fig.update_layout(
-        height=750,
-        margin=dict(l=0, r=0, t=0, b=0),
+        height=780,
+        margin=dict(
+            l=0, r=0, t=0, b=0
+        ),
+        showlegend=False,
         scene=dict(
             xaxis_title="X (m)",
             yaxis_title="Y (m)",
             zaxis_title="Z (m)",
-            aspectmode="data",
+            aspectmode="manual",
+            aspectratio=dict(
+                x=1,
+                y=max(1, L / W),
+                z=1.25
+            ),
             camera=dict(
-                eye=dict(x=1.45, y=-1.4, z=.9)
+                eye=dict(
+                    x=1.7,
+                    y=-1.5,
+                    z=1.0
+                )
             )
-        ),
-        legend=dict(
-            orientation="h",
-            y=-.1
         )
     )
 
@@ -712,81 +583,69 @@ with tab2:
         config={"scrollZoom": True}
     )
 
-    if candidates:
-        rows = []
+    rows = []
 
-        for item in candidates:
-            rows.append({
-                "Cuña": item["name"],
-                "Ubicación": item["zone"],
-                "Volumen (m³)": round(
-                    item["volume"], 3
-                ),
-                "Peso (kN)": round(
-                    item["weight"], 1
-                ),
-                "Persistencia simplificada": (
-                    "Compatible"
-                    if item["persistence_ok"]
-                    else "Incompatible"
-                ),
-                "FS": "No calculado"
-            })
+    for block in blocks:
+        rows.append({
+            "Bloque": f'B{block["id"]}',
+            "Zona principal": block["zone"],
+            "Volumen discretizado (m³)": round(
+                block["volume"], 3
+            ),
+            "Peso (kN)": round(
+                block["volume"] * gamma, 1
+            ),
+            "Límite exterior": (
+                "Sí (no cerrado)"
+                if block["open"] else "No"
+            ),
+            "FS": "No calculado"
+        })
 
-        st.dataframe(
-            rows,
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info(
-            "No hay candidatos visibles con los filtros "
-            "seleccionados. Esto no demuestra que "
-            "la galería esté libre de cuñas."
-        )
+    st.dataframe(
+        rows,
+        hide_index=True,
+        use_container_width=True
+    )
 
     with st.expander(
-        "Consultar todos los candidatos, incluidos los ocultos"
+        "Consultar todas las regiones, incluidas las ocultas"
     ):
         st.dataframe([
             {
-                "Zona": item["zone"],
-                "Volumen (m³)": round(
-                    item["volume"], 3
-                ),
-                "Peso (kN)": round(
-                    item["weight"], 1
-                ),
-                "Persistencia compatible": (
-                    "Sí" if item["persistence_ok"] else "No"
-                )
+                "Bloque": f'B{x["id"]}',
+                "Zona": x["zone"],
+                "Volumen (m³)": round(x["volume"], 3),
+                "Límite exterior": x["open"]
             }
-            for item in sorted(
-                raw_candidates,
-                key=lambda x: x["volume"],
+            for x in sorted(
+                all_blocks,
+                key=lambda q: q["volume"],
                 reverse=True
             )
-        ], use_container_width=True, hide_index=True)
+        ], hide_index=True, use_container_width=True)
 
 
 presets = {
-    "ST-I": (2.0, 2.0, .03, 0.0, False),
-    "ST-II": (2.0, 2.0, .03, 0.0, False),
-    "ST-III": (1.5, 1.5, .08, 0.0, True),
-    "ST-IV superficial": (1.5, 1.5, .12, 8.0, True),
-    "ST-IV profundo": (1.5, 1.5, .15, 10.0, True),
-    "Personalizado": (1.5, 1.5, .08, 0.0, True)
+    "ST-I": (2.0, 0.03, 0.0, False),
+    "ST-II": (2.0, 0.03, 0.0, False),
+    "ST-III": (1.5, 0.08, 0.0, True),
+    "ST-IV superficial": (1.5, 0.12, 8.0, True),
+    "ST-IV profundo": (1.5, 0.15, 10.0, True),
+    "Personalizado": (1.5, 0.08, 0.0, True)
 }
 
-with tab3:
-    st.subheader("Sección 2D y sostenimiento")
+with t3:
+    st.subheader(
+        "Corte transversal y sostenimiento"
+    )
 
     preset = st.selectbox(
-        "Sostenimiento tipo",
+        "Tipo de sostenimiento",
         list(presets)
     )
 
-    bolt_spacing, bolt_long, shot_default, cable_default, mesh_default = (
+    boltsp, shotdefault, cabledefault, meshdefault = (
         presets[preset]
     )
 
@@ -794,22 +653,27 @@ with tab3:
 
     with a:
         bolt_type = st.selectbox(
-            "Tipo de perno",
-            ["Resina", "Split Set", "Swellex", "Sin pernos"]
+            "Pernos",
+            [
+                "Resina",
+                "Split Set",
+                "Swellex",
+                "Sin pernos"
+            ]
         )
-        bolt_length = st.number_input(
+        boltlen = st.number_input(
             "Longitud pernos (m)",
-            .5, 12.0, 2.4
+            0.5, 12.0, 2.4
         )
-        bolt_spacing = st.number_input(
-            "Separación transversal (m)",
-            .3, 5.0, bolt_spacing
+        boltsp = st.number_input(
+            "Separación transversal pernos (m)",
+            0.3, 5.0, boltsp
         )
         bolt_long = st.number_input(
-            "Separación longitudinal (m)",
-            .3, 5.0, bolt_long
+            "Separación longitudinal pernos (m)",
+            0.3, 5.0, 1.5
         )
-        bolt_capacity = st.number_input(
+        bolt_cap = st.number_input(
             "Capacidad nominal perno (kN)",
             1.0, 1000.0, 324.0
         )
@@ -818,7 +682,9 @@ with tab3:
         shot_on = st.checkbox("Gunita", True)
         shot_cm = st.number_input(
             "Espesor gunita (cm)",
-            0.0, 50.0, shot_default*100, .5,
+            0.0, 50.0,
+            shotdefault * 100,
+            0.5,
             disabled=not shot_on
         )
         shot_fc = st.number_input(
@@ -829,72 +695,93 @@ with tab3:
             "ft gunita (MPa)",
             0.0, 20.0, 3.0
         )
-        shot_E = st.number_input(
-            "E gunita (GPa)",
-            1.0, 80.0, 30.0
-        )
         mesh_on = st.checkbox(
-            "Malla metálica", mesh_default
+            "Malla", meshdefault
         )
         cable_on = st.checkbox(
-            "Cables de anclaje",
-            cable_default > 0
+            "Cables",
+            cabledefault > 0
         )
-        cable_length = st.number_input(
+        cablelen = st.number_input(
             "Longitud cables (m)",
             1.0, 25.0,
-            cable_default if cable_default else 8.0,
+            cabledefault or 8.0,
             disabled=not cable_on
         )
-        cable_spacing = st.number_input(
-            "Separación cables (m)",
-            .3, 6.0,
+        cablesp = st.number_input(
+            "Separación transversal cables (m)",
+            0.3, 6.0,
             1.0 if preset == "ST-IV profundo" else 1.5
         )
-        cable_capacity = st.number_input(
-            "Capacidad cable (kN)",
-            1.0, 1500.0, 350.0
+
+    if blocks:
+        options = {
+            f'B{x["id"]} · {x["zone"]}': x
+            for x in blocks
+        }
+
+        choice = st.selectbox(
+            "Centrar cortes en un bloque",
+            list(options)
         )
 
-    if candidates:
-        y_default = float(np.clip(
-            candidates[0]["center"][1], 0, L
-        ))
-    else:
-        y_default = L/2
+        chosen = options[choice]
 
-    ycut = st.slider(
+        y_default = float(
+            yy[np.argmin(
+                abs(yy - chosen["center"][1])
+            )]
+        )
+        x_default = float(
+            xx[np.argmin(
+                abs(xx - chosen["center"][0])
+            )]
+        )
+    else:
+        y_default = L / 2
+        x_default = 0.0
+
+    ycut = st.number_input(
         "Corte transversal Y (m)",
         0.0, float(L),
-        round(y_default, 1), .1
+        float(y_default), 0.1
     )
 
-    xcut = st.slider(
+    xcut = st.number_input(
         "Corte longitudinal X (m)",
-        -float(W), float(W), 0.0, .1
+        float(xx[0]),
+        float(xx[-1]),
+        float(x_default), 0.1
     )
+
+    iy = int(np.argmin(abs(yy - ycut)))
+    ix = int(np.argmin(abs(xx - xcut)))
 
     f = go.Figure()
 
-    for item in candidates:
-        segments = mesh_cut(
-            item["vertices"],
-            item["faces"],
-            1, ycut
-        )
+    for block in blocks:
+        mask = (
+            labels[:, iy, :] == block["id"]
+        ).T.astype(int)
 
-        for j, segm in enumerate(segments):
-            p, q = segm
-            f.add_trace(go.Scatter(
-                x=[p[0], q[0]],
-                y=[p[2], q[2]],
-                mode="lines",
+        if np.any(mask):
+            f.add_trace(go.Contour(
+                x=xx,
+                y=zz,
+                z=mask,
+                contours=dict(
+                    start=0.5,
+                    end=0.5,
+                    size=1,
+                    coloring="none"
+                ),
                 line=dict(
-                    color=item["color"],
+                    color=block["color"],
                     width=3
                 ),
-                name=item["name"],
-                showlegend=j == 0
+                showscale=False,
+                name=f'B{block["id"]}',
+                showlegend=True
             ))
 
     f.add_trace(go.Scatter(
@@ -910,10 +797,12 @@ with tab3:
 
     if shot_on and shot_cm > 0:
         ext = section.copy()
+
         ext[1:-1, 0] += (
-            np.sign(ext[1:-1, 0])*shot_cm/100
+            np.sign(ext[1:-1, 0])
+            * shot_cm / 100
         )
-        ext[1:-1, 1] += shot_cm/100
+        ext[1:-1, 1] += shot_cm / 100
 
         f.add_trace(go.Scatter(
             x=ext[:, 0],
@@ -921,9 +810,9 @@ with tab3:
             mode="lines",
             line=dict(
                 color="#f97316",
-                width=8
+                width=7
             ),
-            name="Gunita (esquemática)"
+            name="Gunita (esquema)"
         ))
 
     if mesh_on:
@@ -933,55 +822,58 @@ with tab3:
             mode="lines",
             line=dict(
                 color="#16a34a",
-                width=3,
-                dash="dot"
+                dash="dot",
+                width=3
             ),
             name="Malla"
         ))
 
-    lengths = np.linalg.norm(
+    seg = np.linalg.norm(
         np.diff(section, axis=0),
         axis=1
     )
-    cumulative = np.r_[
-        0, np.cumsum(lengths)
-    ]
+    cum = np.r_[0, np.cumsum(seg)]
 
     if bolt_type != "Sin pernos":
         for k, s in enumerate(
             np.arange(
-                bolt_spacing/2,
-                cumulative[-1],
-                bolt_spacing
+                boltsp / 2,
+                cum[-1],
+                boltsp
             )
         ):
-            ix = int(np.clip(
-                np.searchsorted(cumulative, s)-1,
-                0, len(lengths)-1
+            i = int(np.clip(
+                np.searchsorted(cum, s) - 1,
+                0, len(seg) - 1
             ))
 
             t = (
-                (s-cumulative[ix])
-                / max(lengths[ix], 1e-9)
-            )
-            p = (
-                section[ix]*(1-t)
-                + section[ix+1]*t
+                (s - cum[i])
+                / max(seg[i], 1e-9)
             )
 
-            if p[1] <= spring and abs(p[0]) > r-.01:
-                n = np.array([
+            p = (
+                section[i] * (1 - t)
+                + section[i + 1] * t
+            )
+
+            if (
+                p[1] <= spring
+                and abs(p[0]) > r - 0.01
+            ):
+                normal2 = np.array([
                     np.sign(p[0]), 0.0
                 ])
             else:
-                n = np.array([
-                    p[0], p[1]-spring
+                normal2 = np.array([
+                    p[0], p[1] - spring
                 ])
-                n /= max(
-                    np.linalg.norm(n), 1e-9
+                normal2 /= max(
+                    np.linalg.norm(normal2),
+                    1e-9
                 )
 
-            q = p+bolt_length*n
+            q = p + boltlen * normal2
 
             f.add_trace(go.Scatter(
                 x=[p[0], q[0]],
@@ -991,28 +883,29 @@ with tab3:
                     color="#2563eb",
                     width=4
                 ),
-                name="Pernos" if k == 0 else None,
+                name="Pernos",
                 showlegend=k == 0
             ))
 
     if cable_on:
         for k, s in enumerate(
             np.arange(
-                cable_spacing/2,
-                math.pi*r,
-                cable_spacing
+                cablesp / 2,
+                math.pi * r,
+                cablesp
             )
         ):
-            angle = math.pi-s/r
+            angle = math.pi - s / r
+
             p = np.array([
-                r*math.cos(angle),
-                spring+r*math.sin(angle)
+                r * math.cos(angle),
+                spring + r * math.sin(angle)
             ])
-            n = np.array([
+
+            q = p + cablelen * np.array([
                 math.cos(angle),
                 math.sin(angle)
             ])
-            q = p+cable_length*n
 
             f.add_trace(go.Scatter(
                 x=[p[0], q[0]],
@@ -1020,14 +913,14 @@ with tab3:
                 mode="lines",
                 line=dict(
                     color="#9333ea",
-                    width=5
+                    width=4
                 ),
-                name="Cables" if k == 0 else None,
+                name="Cables",
                 showlegend=k == 0
             ))
 
     f.update_layout(
-        height=700,
+        height=650,
         xaxis=dict(
             title="X (m)",
             scaleanchor="y",
@@ -1041,34 +934,38 @@ with tab3:
         f, use_container_width=True
     )
 
-    st.subheader("Corte longitudinal")
+    st.subheader(
+        "Corte longitudinal de las mismas regiones"
+    )
 
     fl = go.Figure()
 
-    for item in candidates:
-        segments = mesh_cut(
-            item["vertices"],
-            item["faces"],
-            0, xcut
-        )
+    for block in blocks:
+        mask = (
+            labels[ix, :, :] == block["id"]
+        ).T.astype(int)
 
-        for j, segm in enumerate(segments):
-            p, q = segm
-
-            fl.add_trace(go.Scatter(
-                x=[p[1], q[1]],
-                y=[p[2], q[2]],
-                mode="lines",
+        if np.any(mask):
+            fl.add_trace(go.Contour(
+                x=yy,
+                y=zz,
+                z=mask,
+                contours=dict(
+                    start=0.5,
+                    end=0.5,
+                    size=1,
+                    coloring="none"
+                ),
                 line=dict(
-                    color=item["color"],
+                    color=block["color"],
                     width=3
                 ),
-                name=item["name"],
-                showlegend=j == 0
+                showscale=False,
+                name=f'B{block["id"]}'
             ))
 
     fl.update_layout(
-        height=450,
+        height=440,
         xaxis_title="Y (m)",
         yaxis_title="Z (m)"
     )
@@ -1078,33 +975,33 @@ with tab3:
     )
 
     st.caption(
-        "Los cortes proceden de las mallas 3D aproximadas. "
-        "Pernos, cables, malla y gunita son representaciones "
-        "esquemáticas. No se calcula su contribución al FS."
+        "Los cortes proceden de las mismas regiones "
+        "discretizadas del modelo 3D. Los anclajes son "
+        "esquemáticos; no se calcula su eficacia resistente."
     )
 
 
-with tab4:
+with t4:
     data = {
-        "version": "11",
+        "version": 12,
         "galeria": {
             "ancho": W,
             "alto": H,
             "longitud": L,
             "azimut": az,
-            "pendiente": slope
+            "peso_especifico": gamma
         },
-        "discontinuidades": systems
+        "familias": systems
     }
 
     st.download_button(
-        "Descargar parámetros JSON",
+        "Exportar parámetros JSON",
         json.dumps(
             data,
-            indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
+            indent=2
         ),
-        file_name="geotecnia_mina_v11.json",
+        file_name="geotecnia_v12.json",
         mime="application/json"
     )
 
@@ -1122,89 +1019,67 @@ with tab4:
             )
 
             fd = go.Figure()
-            count = 0
 
-            for ent in doc.modelspace():
-                typ = ent.dxftype()
-                pts = None
+            for e in doc.modelspace():
+                typ = e.dxftype()
 
                 if typ == "LINE":
-                    pts = [
-                        ent.dxf.start[:2],
-                        ent.dxf.end[:2]
-                    ]
+                    pts = np.array([
+                        e.dxf.start[:2],
+                        e.dxf.end[:2]
+                    ])
+
                 elif typ == "LWPOLYLINE":
-                    pts = list(
-                        ent.get_points("xy")
+                    pts = np.array(
+                        list(e.get_points("xy"))
                     )
-                elif typ == "POLYLINE":
-                    pts = [
-                        p.dxf.location[:2]
-                        for p in ent.vertices
-                    ]
-                elif typ in ("CIRCLE", "ARC"):
-                    center = ent.dxf.center
-                    radius = ent.dxf.radius
 
-                    if typ == "CIRCLE":
-                        angles_dxf = np.linspace(
-                            0, 2*np.pi, 120
-                        )
-                    else:
-                        start = ent.dxf.start_angle
-                        end = ent.dxf.end_angle
-
-                        if end < start:
-                            end += 360
-
-                        angles_dxf = np.deg2rad(
-                            np.linspace(
-                                start, end, 120
-                            )
-                        )
+                elif typ == "CIRCLE":
+                    a = np.linspace(
+                        0, 2 * np.pi, 100
+                    )
+                    p = e.dxf.center
+                    rr = e.dxf.radius
 
                     pts = np.column_stack((
-                        center.x
-                        + radius*np.cos(angles_dxf),
-                        center.y
-                        + radius*np.sin(angles_dxf)
+                        p.x + rr * np.cos(a),
+                        p.y + rr * np.sin(a)
                     ))
 
-                if pts is not None:
-                    p = np.array(
-                        pts, dtype=float
-                    )
-                    fd.add_trace(go.Scatter(
-                        x=p[:, 0],
-                        y=p[:, 1],
-                        mode="lines",
-                        showlegend=False
-                    ))
-                    count += 1
+                else:
+                    continue
+
+                fd.add_trace(go.Scatter(
+                    x=pts[:, 0],
+                    y=pts[:, 1],
+                    mode="lines",
+                    showlegend=False
+                ))
 
             fd.update_layout(
-                height=550,
+                height=500,
                 xaxis=dict(
-                    title="X DXF",
                     scaleanchor="y",
                     scaleratio=1
-                ),
-                yaxis_title="Y DXF"
+                )
             )
 
             st.plotly_chart(
-                fd, use_container_width=True
+                fd,
+                use_container_width=True
             )
+
             st.caption(
-                f"{count} entidades representadas. "
-                "El DXF no modifica la geometría."
+                "DXF únicamente como referencia. "
+                "No modifica la geometría de cálculo."
             )
 
         except Exception as exc:
             st.error(
-                f"Error al leer el DXF: {exc}"
+                f"No se pudo leer el DXF: {exc}"
             )
     else:
         st.info(
-            "Sube un archivo DXF desde el panel lateral."
+            "Sube un DXF desde el panel lateral "
+            "para visualizarlo."
         )
