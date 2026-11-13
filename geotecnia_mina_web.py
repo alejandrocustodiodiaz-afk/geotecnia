@@ -156,3 +156,83 @@ for i,s in enumerate(systems):
 
 payload=dict(section=dict(width=width,height=height,length=length,azimuth=az,slope=slope),systems=systems)
 st.download_button('Descargar parámetros JSON',data=json.dumps(payload,indent=2,ensure_ascii=False),file_name='proyecto_geotecnia.json',mime='application/json')
+
+st.divider()
+st.header('Sostenimiento y FS preliminar de bloque definido por el usuario')
+st.error('Este módulo NO calcula cuñas geométricas a partir de los tres planos. El FS mostrado es una estimación de equilibrio límite de un bloque con geometría y modo de deslizamiento INTRODUCIDOS por el usuario. No es válido para dimensionar sostenimiento ni sustituye a UnWedge.')
+
+support_presets={
+ 'Sin sostenimiento': (0.0,0.0,0.0,0.0,0.0),
+ 'ST-I · pernos 2 × 2 m, gunita 3 cm':(2.0,2.0,2.4,324.0,3.0),
+ 'ST-II · configuración editable':(2.0,2.0,2.4,324.0,3.0),
+ 'ST-III · pernos 1,5 × 1,5 m, gunita 8 cm':(1.5,1.5,2.4,324.0,8.0),
+ 'ST-IV superficial · cables 8 m, gunita 12 cm':(1.5,1.5,2.4,324.0,12.0),
+ 'ST-IV profundo · cables 10 m, gunita 15 cm':(1.5,1.5,2.4,324.0,15.0),
+ 'Personalizado':(1.5,1.5,2.4,324.0,8.0)
+}
+preset=st.selectbox('Tipo de sostenimiento',list(support_presets))
+px,py,bl,cap,shot=support_presets[preset]
+a,b,c=st.columns(3)
+with a:
+    sx=st.number_input('Separación transversal pernos (m)',min_value=0.0,value=px,step=0.1)
+    sy=st.number_input('Separación longitudinal pernos (m)',min_value=0.0,value=py,step=0.1)
+    bolt_length=st.number_input('Longitud pernos (m)',min_value=0.0,value=bl,step=0.1)
+    bolt_capacity=st.number_input('Capacidad nominal por perno (kN)',min_value=0.0,value=cap,step=10.0)
+with b:
+    shotcrete=st.number_input('Espesor de gunita (cm)',min_value=0.0,value=shot,step=1.0)
+    cable_length=st.number_input('Longitud cables (m)',min_value=0.0,value=8.0 if 'superficial' in preset else 10.0 if 'profundo' in preset else 0.0,step=1.0)
+    cable_capacity=st.number_input('Capacidad nominal cable (kN)',min_value=0.0,value=350.0,step=10.0)
+    st.checkbox('Malla metálica',value=('ST-III' in preset or 'ST-IV' in preset))
+with c:
+    st.info('Los valores nominales y espesores se registran, pero NO se convierten automáticamente en resistencia movilizada. La aportación efectiva requiere conocer intersección, anclaje, orientación y modo de fallo.')
+
+st.subheader('Equilibrio límite simplificado · bloque hipotético')
+st.caption('Se considera deslizamiento en UN plano con fuerza normal aproximada W cos(β) y fuerza tangencial W sen(β). No se resuelven deslizamientos por dos planos, caída libre, fuerzas 3D ni contacto real con pernos.')
+ca,cb,cc=st.columns(3)
+with ca:
+    volume=st.number_input('Volumen del bloque (m³) — introducido',min_value=0.01,value=5.0)
+    unitweight=st.number_input('Peso específico (kN/m³)',min_value=1.0,value=26.4)
+    beta=st.number_input('Inclinación plano de deslizamiento (°)',min_value=0.0,max_value=89.0,value=55.0)
+with cb:
+    area=st.number_input('Área del plano de deslizamiento (m²)',min_value=0.01,value=6.0)
+    selected=st.selectbox('Sistema de discontinuidades del plano de deslizamiento',range(3),format_func=lambda i:f'Sistema {i+1}')
+    effective_bolts=st.number_input('Número de pernos efectivamente anclados a la cuña',min_value=0,value=0,step=1)
+with cc:
+    effective_cables=st.number_input('Número de cables efectivamente anclados a la cuña',min_value=0,value=0,step=1)
+    bolt_fraction=st.slider('Fracción movilizada de capacidad de anclajes (hipótesis)',0.0,1.0,0.0,0.05)
+    st.caption('Valor por defecto 0: no atribuye resistencia sin verificación del anclaje.')
+
+s=systems[selected]
+W=volume*unitweight
+normal_force=W*math.cos(math.radians(beta))
+driving=W*math.sin(math.radians(beta))
+water_force=s['water_pressure']*1000.0*area
+normal_effective=max(0.0,normal_force-water_force)
+sigma_eff=normal_effective/area/1000.0
+method=s['method']
+tau=None
+if method=='Mohr-Coulomb':
+    tau=s['cohesion']+sigma_eff*math.tan(math.radians(s['phi']))
+elif method=='Barton-Bandis' and sigma_eff>0:
+    angle=s['residual_phi']+s['jrc']*math.log10(s['jcs']/sigma_eff)
+    if 0<angle<89: tau=sigma_eff*math.tan(math.radians(angle))
+elif method.startswith('Patton') and s['phi']+s['rough']<89:
+    tau=sigma_eff*math.tan(math.radians(s['phi']+s['rough']))
+
+if method.startswith('Hoek'):
+    st.warning('Hoek-Brown no puede utilizarse directamente como resistencia de junta para este FS. Selecciona Mohr-Coulomb, Barton-Bandis o Patton.')
+elif tau is None:
+    st.warning('No puede calcularse el FS con estos parámetros. Revisa la tensión efectiva y el dominio del criterio seleccionado.')
+elif driving<=1e-9:
+    st.warning('No existe fuerza motriz por deslizamiento en este esquema (β = 0°); FS no definido.')
+else:
+    shear_resistance=tau*1000.0*area
+    anchorage=bolt_fraction*(effective_bolts*bolt_capacity+effective_cables*cable_capacity)
+    fs0=shear_resistance/driving
+    fs1=(shear_resistance+anchorage)/driving
+    m1,m2,m3=st.columns(3)
+    m1.metric('FS sin sostenimiento (hipotético)',f'{fs0:.2f}')
+    m2.metric('FS con anclajes supuestos (hipotético)',f'{fs1:.2f}')
+    m3.metric('Peso del bloque',f'{W:.1f} kN')
+    st.caption(f'Resistencia al corte: {shear_resistance:.1f} kN · Fuerza motriz: {driving:.1f} kN · Aportación supuesta de anclajes: {anchorage:.1f} kN. Gunita y malla NO incluidas en el FS.')
+    st.warning('FS NO VALIDADO: geometría, persistencia, presión hidráulica y resistencia movilizada deben contrastarse con un modelo de cuña tridimensional y una metodología de diseño validada.')
