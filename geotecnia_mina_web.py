@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title='Geotecnia Mina Web',layout='wide')
 st.title('Geotecnia Mina · visor geotécnico 3D')
-st.warning('Prototipo de visualización y resistencia. NO identifica cuñas cerradas ni calcula su factor de seguridad o sostenimiento.')
+st.warning('Versión exploratoria: calcula líneas de intersección entre planos, pero NO identifica cuñas cerradas ni calcula su factor de seguridad o sostenimiento. No usar para diseño.')
 
 with st.sidebar:
     st.header('Galería')
@@ -33,7 +33,13 @@ for i,col in enumerate(cols):
         jcs=st.number_input('JCS (MPa)',0.01,500.0,30.0,key=f'jcs{i}')
         residual=st.number_input('Fricción residual (°)',0.0,89.0,25.0,key=f'res{i}')
         pressure=st.number_input('Presión agua (MPa)',0.0,100.0,0.0,key=f'u{i}')
-        systems.append(dict(dip_direction=dipdir,dip=dip,spacing=spacing,persistence=persistence,cohesion=cohesion,phi=phi,jrc=jrc,jcs=jcs,residual_phi=residual,water_pressure=pressure))
+        method=st.selectbox('Criterio resistente', ['Mohr-Coulomb','Barton-Bandis','Patton (rama de asperezas)','Hoek-Brown (macizo, no junta)'],key=f'method{i}')
+        rough=st.number_input('Ángulo de asperezas Patton (°)',0.0,45.0,10.0,key=f'rough{i}')
+        ucs=st.number_input('UCS macizo (MPa)',0.01,1000.0,52.6,key=f'ucs{i}')
+        mi=st.number_input('mi Hoek-Brown',0.1,100.0,20.0,key=f'mi{i}')
+        gsi=st.number_input('GSI',0.0,100.0,50.0,key=f'gsi{i}')
+        d=st.number_input('D',0.0,1.0,0.0,key=f'd{i}')
+        systems.append(dict(dip_direction=dipdir,dip=dip,spacing=spacing,persistence=persistence,cohesion=cohesion,phi=phi,jrc=jrc,jcs=jcs,residual_phi=residual,water_pressure=pressure,method=method,rough=rough,ucs=ucs,mi=mi,gsi=gsi,d=d))
 
 # Coordinates: x horizontal across section, y tunnel axis, z vertical.
 def to_world(x,y,z):
@@ -52,16 +58,37 @@ for j in range(0,len(xs),max(1,len(xs)//12)):
     a=to_world(xs[j],0,zs[j]); b=to_world(xs[j],length,zs[j])
     fig.add_trace(go.Scatter3d(x=[a[0],b[0]],y=[a[1],b[1]],z=[a[2],b[2]],mode='lines',line=dict(color='lightgray',width=2),showlegend=False))
 
-# Three illustrative finite planes, oriented with dip/dip direction.
+# Three finite planes, oriented with dip/dip direction; position is illustrative.
+plane_centers=[]; plane_normals=[]
 for i,s in enumerate(systems):
     dd=math.radians(s['dip_direction']); dip=math.radians(s['dip'])
     strike=np.array([math.cos(dd),-math.sin(dd),0.0])
     down=np.array([math.sin(dd)*math.cos(dip),math.cos(dd)*math.cos(dip),-math.sin(dip)])
     center=np.array(to_world(0,length*(i+1)/4,height*.75))
+    plane_centers.append(center)
+    plane_normals.append(np.cross(strike,down)/np.linalg.norm(np.cross(strike,down)))
     scale=min(s['persistence'],length,12)/2
     corners=[center+u*scale*strike+v*scale*down for u,v in [(-1,-1),(1,-1),(1,1),(-1,1)]]
     pts=np.array(corners)
     fig.add_trace(go.Mesh3d(x=pts[:,0],y=pts[:,1],z=pts[:,2],i=[0,0],j=[1,2],k=[2,3],opacity=.35,name=f'Sistema {i+1}',hovertext=f'DD {s["dip_direction"]}°, dip {s["dip"]}°'))
+
+# Intersección matemática de planos infinitos (NO equivale a una cuña cerrada).
+st.subheader('Intersecciones de los tres planos')
+st.caption('Los planos se sitúan de forma ilustrativa en el espacio. Para obtener cuñas reales es imprescindible definir la posición de cada discontinuidad y su extensión; una orientación media por familia no basta.')
+for i,j in [(0,1),(0,2),(1,2)]:
+    ni,nj=plane_normals[i],plane_normals[j]
+    direction=np.cross(ni,nj)
+    norm=np.linalg.norm(direction)
+    if norm<1e-7:
+        st.info(f'Sistemas {i+1} y {j+1}: planos paralelos o coincidentes.')
+        continue
+    direction=direction/norm
+    A=np.stack([ni,nj,direction])
+    b=np.array([np.dot(ni,plane_centers[i]),np.dot(nj,plane_centers[j]),0.0])
+    origin=np.linalg.solve(A,b)
+    extent=min(length,12.0)
+    pts=np.stack([origin-extent*direction,origin+extent*direction])
+    fig.add_trace(go.Scatter3d(x=pts[:,0],y=pts[:,1],z=pts[:,2],mode='lines',line=dict(width=7,dash='dash'),name=f'Intersección {i+1}-{j+1}'))
 
 if uploaded is not None:
     try:
@@ -87,37 +114,45 @@ if uploaded is not None:
     except Exception as exc:
         st.error(f'No se pudo leer el DXF: {exc}. Exporta como DXF ASCII desde AutoCAD.')
 fig.update_layout(height=620,scene=dict(aspectmode='data',xaxis_title='X (m)',yaxis_title='Y (m)',zaxis_title='Z (m)'),margin=dict(l=0,r=0,b=0,t=10))
+fig.update_layout(scene_camera=dict(eye=dict(x=1.65,y=1.8,z=1.15)),scene=dict(aspectmode='data',xaxis_title='X (m)',yaxis_title='Y (m)',zaxis_title='Z (m)'),height=750)
 st.plotly_chart(fig,use_container_width=True)
+st.caption('Amplía la figura con la rueda del ratón. Las líneas discontinuas son intersecciones de planos infinitos; no indican necesariamente cuñas inestables.')
 
-st.subheader('Calculadora de resistencia')
-criterion=st.selectbox('Criterio',['Mohr-Coulomb (junta)','Barton-Bandis (junta)','Patton simplificado (junta)','Hoek-Brown generalizado (macizo)'])
-normal=st.number_input('Tensión normal total (MPa)',0.0,500.0,1.0)
-system_index=st.selectbox('Sistema', [1,2,3])-1
-s=systems[system_index]; effective=max(0.0,normal-s['water_pressure'])
-if criterion.startswith('Mohr'):
-    result=s['cohesion']+effective*math.tan(math.radians(s['phi']))
-    st.metric('Resistencia al corte (MPa)',f'{result:.4f}')
-elif criterion.startswith('Barton'):
-    if effective<=0:
-        st.info('Barton-Bandis requiere tensión normal efectiva positiva.')
-    else:
-        result=effective*math.tan(math.radians(s['residual_phi']+s['jrc']*math.log10(s['jcs']/effective)))
-        st.metric('Resistencia al corte estimada (MPa)',f'{result:.4f}')
-        st.caption('Aplicar solo dentro del dominio válido de JRC, JCS y tensiones normales; sin corrección de escala.')
-elif criterion.startswith('Patton'):
-    rough=st.number_input('Ángulo de asperezas (°)',0.0,45.0,10.0)
-    st.metric('Resistencia al corte idealizada (MPa)',f'{effective*math.tan(math.radians(min(89,s["phi"]+rough))):.4f}')
-    st.caption('Rama de deslizamiento sobre asperezas; no modela su rotura.')
-else:
-    ucs=st.number_input('UCS intacta (MPa)',0.01,1000.0,52.6)
-    mi=st.number_input('mi',0.1,100.0,20.0)
-    gsi=st.number_input('GSI',0.0,100.0,50.0)
-    d=st.number_input('Factor D',0.0,1.0,0.0)
-    sigma3=st.number_input('Confinamiento sigma3 (MPa)',0.0,500.0,1.0)
-    mb=mi*math.exp((gsi-100)/(28-14*d)); shb=math.exp((gsi-100)/(9-3*d)); a=.5+(math.exp(-gsi/15)-math.exp(-20/3))/6
-    sigma1=sigma3+ucs*(mb*sigma3/ucs+shb)**a
-    st.metric('Tensión principal mayor a rotura σ1 (MPa)',f'{sigma1:.4f}')
-    st.caption('Hoek-Brown evalúa resistencia del macizo, no resistencia al corte de una junta.')
+st.subheader('Resistencia por sistema de discontinuidades')
+st.caption('Selecciona el criterio de cada sistema arriba. Las tensiones son valores introducidos por el usuario; no se deducen automáticamente de una cuña.')
+normal=st.number_input('Tensión normal total de evaluación (MPa)',0.0,500.0,1.0)
+for i,s in enumerate(systems):
+    method=s['method']; effective=max(0.0,normal-s['water_pressure'])
+    with st.expander(f'Sistema {i+1} · {method}',expanded=True):
+        if method=='Mohr-Coulomb':
+            tau=s['cohesion']+effective*math.tan(math.radians(s['phi']))
+            st.metric('Resistencia al corte (MPa)',f'{tau:.4f}')
+        elif method=='Barton-Bandis':
+            if effective<=0:
+                st.info('Se necesita tensión normal efectiva positiva.')
+            else:
+                angle=s['residual_phi']+s['jrc']*math.log10(s['jcs']/effective)
+                if not (0<angle<89):
+                    st.error('Parámetros fuera del rango admisible para esta formulación simplificada.')
+                else:
+                    tau=effective*math.tan(math.radians(angle))
+                    st.metric('Resistencia al corte estimada (MPa)',f'{tau:.4f}')
+                    st.caption('Sin corrección de escala; verificar el dominio de aplicación.')
+        elif method.startswith('Patton'):
+            angle=s['phi']+s['rough']
+            if angle>=89:
+                st.error('Ángulo total no admisible.')
+            else:
+                st.metric('Resistencia al corte idealizada (MPa)',f'{effective*math.tan(math.radians(angle)):.4f}')
+                st.caption('Solo rama de deslizamiento sobre asperezas; no representa su rotura.')
+        else:
+            ucs,mi,gsi,d=s['ucs'],s['mi'],s['gsi'],s['d']
+            mb=mi*math.exp((gsi-100)/(28-14*d))
+            shb=math.exp((gsi-100)/(9-3*d))
+            a=.5+(math.exp(-gsi/15)-math.exp(-20/3))/6
+            sigma1=normal+ucs*(mb*normal/ucs+shb)**a
+            st.metric('σ1 a rotura del macizo (MPa)',f'{sigma1:.4f}')
+            st.warning('Hoek-Brown no es un criterio de resistencia al corte de una discontinuidad.')
 
 payload=dict(section=dict(width=width,height=height,length=length,azimuth=az,slope=slope),systems=systems)
 st.download_button('Descargar parámetros JSON',data=json.dumps(payload,indent=2,ensure_ascii=False),file_name='proyecto_geotecnia.json',mime='application/json')
