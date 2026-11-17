@@ -4,18 +4,32 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
-from skimage.measure import marching_cubes
+from skimage.measure import marching_cubes, find_contours
 
-st.set_page_config(page_title='Geotecnia Mina v16.1', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
-st.markdown('''<style>
-.stApp,[data-testid="stSidebar"]{background:#0b1421;color:#e6edf7}
-[data-testid="stMetric"]{background:#142438;border:1px solid #2b435d;border-radius:12px;padding:12px}
-[data-testid="stTabs"] button{font-weight:650}
-.block-container{padding-top:1.1rem;max-width:1600px}
-h1,h2,h3{color:#e9f4ff!important}
-</style>''', unsafe_allow_html=True)
+st.set_page_config(page_title='Geotecnia Mina v16.3', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.markdown("""<style>
+/* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
+html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
+[data-testid="stSidebar"]{background:#101d2f!important}
+.stApp p,.stApp label,.stApp span,.stApp small,.stApp div[data-testid="stMarkdownContainer"],
+[data-testid="stWidgetLabel"] *,[data-testid="stCaptionContainer"] *,
+[data-testid="stSidebar"] p,[data-testid="stSidebar"] label,
+[data-testid="stMetricLabel"] *,[data-testid="stMetricValue"] *,
+[data-testid="stTabs"] button,[data-testid="stTabs"] button *{color:#eaf3ff!important}
+[data-testid="stCaptionContainer"],.stApp small{color:#c5d6eb!important}
+[data-testid="stMetric"]{background:#18283e;border:1px solid #47617f;border-radius:12px;padding:12px}
+[data-testid="stMetricValue"]{font-size:1.55rem!important;font-weight:750!important}
+[data-testid="stMetricLabel"]{font-weight:650!important}
+[data-testid="stNumberInput"] input,[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] [data-baseweb="select"] *,
+[data-testid="stNumberInput"] button{color:#142235!important}
+[data-testid="stSlider"] [data-testid="stTickBar"] *,[data-testid="stSlider"] [data-testid="stThumbValue"]{color:#ffffff!important}
+[data-testid="stTabs"] button{font-weight:700!important;font-size:.95rem!important}
+.stApp h1,.stApp h2,.stApp h3,.stApp h4{color:#fff!important}
+.block-container{padding-top:1rem;max-width:1750px}
+</style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v16.1')
+st.title('⛏️ GEOTECNIA MINA  ·  v16.3')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -57,7 +71,7 @@ with st.sidebar:
  shot=st.number_input('Espesor gunita (m)',0.,.5,shot,.01)
  cablelen=st.number_input('Longitud cables (m)',0.,20.,cl,.5)
  mesh=st.checkbox('Malla metálica',value=mesh)
- show_bolts=st.checkbox('Mostrar pernos/cables 3D',True)
+ show_bolts=True # La visibilidad real se controla en el visor 3D
  st.caption('La representación de sostenimiento es geométrica; no implica capacidad resistente verificada.')
 
 r=W/2.; spring=max(0.,H-r)
@@ -177,7 +191,7 @@ def surface_analytic(labels,ident,xs,ys,zs,W,H,L,az,nplanes,systems_json,quality
  axes=[np.linspace(mins[i],maxs[i],dims[i]) for i in range(3)]
  X,Y,Z=np.meshgrid(*axes,indexing='ij')
  center=np.array([xs[idx[:,0]].mean(),ys[idx[:,1]].mean(),zs[idx[:,2]].mean()])
- field=np.full(X.shape,np.inf,dtype=np.float32)
+ field=np.full(X.shape,-np.inf,dtype=np.float32)
  for fam in systems:
   n=normal((fam['dd']-az)%360,fam['dip'])
   base=np.dot(n,[fam['xx'],fam['yy'],H])
@@ -185,15 +199,15 @@ def surface_analytic(labels,ident,xs,ys,zs,W,H,L,az,nplanes,systems_json,quality
    off=(k-(nplanes-1)/2)*fam['spacing']
    signed=n[0]*X+n[1]*Y+n[2]*Z-base-off
    side=1. if (np.dot(n,center)-base-off)>=0 else -1.
-   np.minimum(field,side*signed,out=field)
+   np.maximum(field,-side*signed,out=field)
  r=W/2.;spring=max(0.,H-r)
  # Distancia exterior aproximada a herradura: frontera exacta de hastiales y arco.
  outside=np.where(Z<=spring,np.abs(X)-r,np.sqrt(X*X+(Z-spring)**2)-r)
- np.minimum(field,outside,out=field)
+ np.maximum(field,-outside,out=field)
  # Límite de dominio; para regiones cerradas no debe cortar el sólido.
  for coord,lower,upper in [(X,xs[0],xs[-1]),(Y,ys[0],ys[-1]),(Z,zs[0],zs[-1])]:
-  np.minimum(field,coord-lower,out=field)
-  np.minimum(field,upper-coord,out=field)
+  np.maximum(field,lower-coord,out=field)
+  np.maximum(field,coord-upper,out=field)
  if not (np.nanmin(field)<0<np.nanmax(field)):return None
  verts,faces,_,_=marching_cubes(field,level=0.,spacing=tuple(float(a[1]-a[0]) for a in axes))
  verts+=mins
@@ -222,6 +236,25 @@ with tabs[0]:
   scale=st.slider('Escala de análisis de cuña',.5,2.,1.,.05)
   focus=st.checkbox('Acercar cámara a la cuña',True)
   quality=st.slider('Calidad de superficie 3D',55,115,85,10)
+ st.markdown('#### 👁️ Herramientas de visualización 3D')
+ with st.expander('Mostrar / ocultar elementos, etiquetas y cámara',expanded=True):
+  vc1,vc2,vc3=st.columns(3)
+  with vc1:
+   view_tunnel=st.checkbox('Galería',True,key='view_tunnel')
+   view_wedge=st.checkbox('Cuñas',True,key='view_wedge')
+   st.caption('Trazas J1–J3: pendientes de implementación geométrica')
+  with vc2:
+   view_bolts=st.checkbox('Pernos',True,key='view_bolts')
+   view_cables=st.checkbox('Cables',True,key='view_cables')
+   view_axes=st.checkbox('Ejes y números',True,key='view_axes')
+  with vc3:
+   view_grid=st.checkbox('Cuadrícula',False,key='view_grid')
+   view_labels=st.checkbox('Títulos de ejes',True,key='view_labels')
+   label_size=st.slider('Tamaño de números',12,24,17,1,key='label_size')
+  camera_view=st.selectbox('Vista de cámara',['Isométrica','Frontal','Lateral','Superior','Centrar cuña'],key='camera_view')
+  if st.button('Restablecer visualización',key='reset_view'):
+   for k,v in {'view_tunnel':True,'view_wedge':True,'view_bolts':True,'view_cables':True,'view_axes':True,'view_grid':False,'view_labels':True,'label_size':17,'camera_view':'Isométrica'}.items():st.session_state[k]=v
+   st.rerun()
  st.caption('Escala: transforma una copia visual de la región seleccionada alrededor de su centro; el volumen de escenario se multiplica por escala³. No modifica los planos ni representa una cuña geológicamente demostrada.')
  a,b,c,d=st.columns(4)
  a.metric('Volumen geométrico',f"{selected['volume']:.3f} m³")
@@ -230,10 +263,12 @@ with tabs[0]:
  d.metric('Peso escalado',f"{selected['volume']*gamma*scale**3:.1f} kN")
  fig=go.Figure();ymin=max(0,selected['contact'][1]-2.5) if focus else 0;ymax=min(L,selected['contact'][1]+2.5) if focus else L
  tv,tf=tunnel_surface(section,ymin,ymax)
- fig.add_trace(go.Mesh3d(x=tv[:,0],y=tv[:,1],z=tv[:,2],i=tf[:,0],j=tf[:,1],k=tf[:,2],color='#81b8e6',opacity=.16,flatshading=True,hoverinfo='skip',name='Galería'))
- for y in [ymin,ymax]:fig.add_trace(go.Scatter3d(x=section[:,0],y=np.full(len(section),y),z=section[:,1],mode='lines',line=dict(color='#a2b6ca',width=5),showlegend=False,hoverinfo='skip'))
- for x,z in section[::8]:fig.add_trace(go.Scatter3d(x=[x,x],y=[ymin,ymax],z=[z,z],mode='lines',line=dict(color='#9cc7ed',width=3),showlegend=False,hoverinfo='skip'))
- shown=[selected] if mode=='Solo seleccionada' else ([v for v in visible if not v['open']] if mode=='Todas las cerradas' else visible)
+ if view_tunnel:fig.add_trace(go.Mesh3d(x=tv[:,0],y=tv[:,1],z=tv[:,2],i=tf[:,0],j=tf[:,1],k=tf[:,2],color='#81b8e6',opacity=.16,flatshading=True,hoverinfo='skip',name='Galería'))
+ if view_tunnel:
+  for y in [ymin,ymax]:fig.add_trace(go.Scatter3d(x=section[:,0],y=np.full(len(section),y),z=section[:,1],mode='lines',line=dict(color='#a2b6ca',width=5),showlegend=False,hoverinfo='skip'))
+ if view_tunnel:
+  for x,z in section[::8]:fig.add_trace(go.Scatter3d(x=[x,x],y=[ymin,ymax],z=[z,z],mode='lines',line=dict(color='#9cc7ed',width=3),showlegend=False,hoverinfo='skip'))
+ shown=([selected] if mode=='Solo seleccionada' else ([v for v in visible if not v['open']] if mode=='Todas las cerradas' else visible)) if view_wedge else []
  shown=sorted(shown,key=lambda b:b['volume'],reverse=True)[:35]
  for j,v in enumerate(shown):
   result=(surface_analytic(labels,v['id'],xs,ys,zs,W,H,L,az,nplanes,json.dumps(systems,sort_keys=True),quality) if not v['open'] else None)
@@ -263,8 +298,9 @@ with tabs[0]:
   if not inside.any():return False,0.
   last=np.flatnonzero(inside)[-1];return True,float(np.linalg.norm(q-p)*(1-t[last]))
  hits=[]
- if show_bolts:
+ if view_bolts or view_cables:
   for p,out,length,kind in bolts():
+   if (kind=='Perno' and not view_bolts) or (kind=='Cable' and not view_cables):continue
    q=p+out*length
    if focus and not(ymin-.2<=p[1]<=ymax+.2):continue
    hit,tail=intersection(p,q,selected['id']);hits.append((kind,hit,tail))
@@ -274,12 +310,31 @@ with tabs[0]:
  xr=[cx-span*.65,cx+span*.65] if focus else [xs[0],xs[-1]]
  yr=[max(0,cy-span*.7),min(L,cy+span*.7)] if focus else [0,L]
  zr=[max(0,cz-span*.65),min(zs[-1],cz+span*.65)] if focus else [0,zs[-1]]
- fig.update_layout(height=740,margin=dict(l=0,r=0,t=5,b=0),paper_bgcolor='#0b1421',font_color='#d9e8f6',scene=dict(domain=dict(x=[0,1],y=[0,1]),bgcolor='#0b1421',xaxis=dict(title='Transversal X (m)',backgroundcolor='#0b1421',color='#9ab0c6',range=xr),yaxis=dict(title='Eje Y (m)',backgroundcolor='#0b1421',color='#9ab0c6',range=yr),zaxis=dict(title='Altura Z (m)',backgroundcolor='#0b1421',color='#9ab0c6',range=zr),aspectmode='data',camera=dict(eye=dict(x=1.35,y=-1.65,z=.95),projection=dict(type='orthographic'))),showlegend=False)
+ # Plotly: texto grande y blanco, cuadrícula opcional y cámara configurable.
+ cameras={'Isométrica':dict(x=1.4,y=-1.7,z=1.15),'Frontal':dict(x=0,y=-2.5,z=.35),
+          'Lateral':dict(x=2.5,y=0,z=.35),'Superior':dict(x=.01,y=-.01,z=2.8),
+          'Centrar cuña':dict(x=1.0,y=-1.2,z=.85)}
+ def axis_style(title,rng):
+  return dict(title=dict(text=title if view_labels else '',font=dict(size=label_size+1,color='#ffffff')),
+              range=rng,visible=view_axes,showticklabels=view_axes,
+              tickfont=dict(size=label_size,color='#ffffff'),tickcolor='#ffffff',
+              showgrid=view_grid,gridcolor='#50647e',gridwidth=1,
+              showbackground=False,zeroline=False,ticks='outside',ticklen=5,
+              nticks=5)
+ fig.update_layout(height=780,margin=dict(l=0,r=0,t=0,b=0),paper_bgcolor='#0b1421',
+     font=dict(color='#ffffff',size=label_size),
+     scene=dict(domain=dict(x=[0,1],y=[0,1]),bgcolor='#0b1421',
+                xaxis=axis_style('Transversal X (m)',xr),
+                yaxis=axis_style('Eje Y (m)',yr),
+                zaxis=axis_style('Altura Z (m)',zr),
+                aspectmode='data',camera=dict(eye=cameras[camera_view],
+                    projection=dict(type='orthographic'))),showlegend=False)
+
  st.plotly_chart(fig,use_container_width=True)
  st.caption('Galería azul semitransparente, región seleccionada verde; zoom y rotación con el ratón. Las dimensiones y el encuadre pueden ajustarse con los controles.')
  st.caption('Superficie 3D reconstruida mediante ecuaciones de planos y sección de herradura para regiones cerradas; identificación del bloque aún basada en vóxeles. Las caras y volúmenes necesitan verificación geométrica independiente.')
  st.info('La clasificación abierta/cerrada se refiere exclusivamente a los límites del dominio discretizado. No se ha comprobado la liberación cinemática ni la estabilidad.')
- if show_bolts:
+ if view_bolts or view_cables:
   h=[x for x in hits if x[1]]
   st.write(f"**Intersecciones geométricas aproximadas con B{selected['id']}:** {len(h)} de {len(hits)} elementos representados en la ventana 3D.")
   if h:st.write(f"Longitud exterior tras la última intersección: mínimo **{min(x[2] for x in h):.2f} m**. No equivale a longitud de anclaje efectiva verificada.")
@@ -340,22 +395,82 @@ with tabs[1]:
  st.download_button('Descargar mediciones CSV',pd.DataFrame(rows).to_csv(index=False).encode('utf-8-sig'),'angulos_polos.csv','text/csv')
  st.info('Para usar una curva de B de Potvin debe verificarse qué ángulo define exactamente esa curva. El ángulo entre polos y el ángulo polo–plano no son intercambiables.')
 
+# Cortes de resolución independiente del mallado voxel, usando planos analíticos.
+# El recorte de dominio y la clasificación siguen siendo preliminares.
+def slice_region(plane, position, block, nx=360, nz=300):
+    r=W/2.; spring=max(0.,H-r)
+    if plane=='transversal':
+        h=np.linspace(-r-2.0,r+2.0,nx)
+    else:
+        h=np.linspace(0,L,nx)
+    z=np.linspace(-.35,H+3.,nz)
+    U,Z=np.meshgrid(h,z)
+    if plane=='transversal': X=U;Y=np.full_like(U,position)
+    else: X=np.full_like(U,position);Y=U
+    center=np.asarray(block['center'])
+    # Campo negativo dentro de la celda definida por las mismas caras de discontinuidad.
+    field=np.full_like(U,-1.e6,dtype=float)
+    for fam in systems:
+        n=normal((fam['dd']-az)%360,fam['dip'])
+        base=np.dot(n,[fam['xx'],fam['yy'],H])
+        for k in range(nplanes):
+            offset=(k-(nplanes-1)/2)*fam['spacing']
+            signed=n[0]*X+n[1]*Y+n[2]*Z-base-offset
+            side=1. if (np.dot(n,center)-base-offset)>=0 else -1.
+            field=np.maximum(field,-side*signed)
+    # Roca exterior a la excavación; sección en herradura con piso excluido.
+    outside=np.where(Z<=spring,np.abs(X)-r,np.sqrt(X*X+(Z-spring)**2)-r)
+    field=np.maximum(field,-outside)
+    # Dominio finito: no es una superficie geológica de cierre.
+    for coord,lo,hi in ((X,xs[0],xs[-1]),(Y,ys[0],ys[-1]),(Z,zs[0],zs[-1])):
+        field=np.maximum(field,lo-coord)
+        field=np.maximum(field,coord-hi)
+    return h,z,field
+
+def make_slice(plane,position,block):
+    h,z,field=slice_region(plane,position,block)
+    fig=go.Figure()
+    # Extraer isolíneas continuas, en lugar de dibujar cuadrados del mallado.
+    contours=find_contours(field,0.0)
+    for poly in contours:
+        if len(poly)<5:continue
+        xx=np.interp(poly[:,1],np.arange(len(h)),h)
+        zz=np.interp(poly[:,0],np.arange(len(z)),z)
+        fig.add_trace(go.Scatter(x=xx,y=zz,mode='lines',fill='toself',
+            fillcolor='rgba(30,190,145,.55)',line=dict(color='#00c998',width=2.6),
+            name='Región analítica',hovertemplate='%{x:.2f} m / %{y:.2f} m<extra></extra>'))
+    r=W/2.;spring=max(0.,H-r)
+    if plane=='transversal':
+        fig.add_trace(go.Scatter(x=section[:,0],y=section[:,1],mode='lines',
+            line=dict(color='#2563eb',width=5),name='Contorno de excavación'))
+        fig.add_trace(go.Scatter(x=[-r,r],y=[0,0],mode='lines',
+            line=dict(color='#64748b',width=2,dash='dash'),name='Solera (sin sostenimiento)'))
+        xr=[-r-2,r+2];xlabel='Transversal X (m)'
+    else:
+        roof=spring+np.sqrt(max(0,r*r-position*position)) if abs(position)<=r else None
+        if roof is not None:
+            fig.add_trace(go.Scatter(x=[0,L,L,0,0],y=[0,0,roof,roof,0],
+                mode='lines',fill='toself',fillcolor='rgba(59,130,246,.09)',
+                line=dict(color='#2563eb',width=3),name='Excavación longitudinal'))
+        xr=[0,L];xlabel='Longitudinal Y (m)'
+    fig.update_layout(height=530,margin=dict(l=60,r=20,t=55,b=55),
+        title=('Transversal Y' if plane=='transversal' else 'Longitudinal X')+f' = {position:.2f} m',
+        paper_bgcolor='#ffffff',plot_bgcolor='#f8fafc',font=dict(color='#172b45',size=13),
+        xaxis=dict(title=xlabel,range=xr,showgrid=True,gridcolor='#dce5ee',zeroline=False),
+        yaxis=dict(title='Altura Z (m)',range=[-.5,H+3.2],showgrid=True,gridcolor='#dce5ee',
+                   scaleanchor='x',scaleratio=1,zeroline=False),
+        legend=dict(orientation='h',y=-.19),hovermode='closest')
+    return fig
+
 with tabs[2]:
- st.subheader('Cortes vinculados a la región seleccionada')
+ st.subheader('Cortes 2D · contornos continuos y excavación completa')
+ st.caption('Secciones de los planos analíticos que delimitan la región seleccionada. No son una comprobación de liberación cinemática ni de persistencia de juntas.')
  cuty=st.slider('Posición del corte transversal Y (m)',0.,float(L),float(np.clip(selected['contact'][1],0,L)),.1)
- iy=int(np.argmin(abs(ys-cuty)));ix=int(np.argmin(abs(xs-selected['contact'][0])))
+ cutx=st.slider('Posición del corte longitudinal X (m)',float(-W/2),float(W/2),float(np.clip(selected['contact'][0],-W/2,W/2)),.1)
  ca,cb=st.columns(2)
- def heat(z,x,y,title,xlabel,ylabel):
-  f=go.Figure();f.add_trace(go.Heatmap(z=z,x=x,y=y,colorscale=[[0,'#142438'],[1,'#36d6bb']],showscale=False,hovertemplate='X=%{x:.2f}, Y=%{y:.2f}<extra></extra>'))
-  f.update_layout(title=title,height=430,paper_bgcolor='#0b1421',plot_bgcolor='#0b1421',font_color='#d9e8f6',xaxis_title=xlabel,yaxis_title=ylabel,margin=dict(l=20,r=10,t=50,b=35));return f
- with ca:
-  f=heat(np.where(labels[:,iy,:]==selected['id'],1.,np.nan).T,xs,zs,f'Corte transversal Y={ys[iy]:.2f} m','Transversal (m)','Altura (m)')
-  f.add_trace(go.Scatter(x=section[:,0],y=section[:,1],mode='lines',line=dict(color='#eeb65d',width=4),name='Excavación'))
-  st.plotly_chart(f,use_container_width=True)
- with cb:
-  f=heat(np.where(labels[ix,:,:]==selected['id'],1.,np.nan).T,ys,zs,f'Corte longitudinal X={xs[ix]:.2f} m','Longitud (m)','Altura (m)')
-  st.plotly_chart(f,use_container_width=True)
- st.caption('El corte utiliza las mismas etiquetas voxelizadas que el modelo 3D. Los bordes escalonados dependen de la resolución.')
+ with ca:st.plotly_chart(make_slice('transversal',cuty,selected),use_container_width=True)
+ with cb:st.plotly_chart(make_slice('longitudinal',cutx,selected),use_container_width=True)
+ st.info('Los contornos son continuos e independientes de la resolución voxel. Las caras son prolongaciones de planos sin recorte por persistencia; una región cerrada en el dominio no demuestra que sea una cuña desprendible.')
 
 with tabs[3]:
  st.subheader('Sostenimiento seleccionado')
@@ -383,11 +498,11 @@ with tabs[5]:
  df_sens=pd.DataFrame({'Escala visual':np.round(multipliers,2),'Volumen visual (m³)':selected['volume']*multipliers**3,'Peso visual (kN)':selected['volume']*gamma*multipliers**3})
  st.line_chart(df_sens.set_index('Escala visual')[['Volumen visual (m³)']],height=300)
  st.dataframe(df_sens.round(3),hide_index=True,use_container_width=True)
- st.download_button('Descargar sensibilidad CSV',df_sens.to_csv(index=False).encode('utf-8-sig'),'sensibilidad_geometrica_v161.csv','text/csv')
+ st.download_button('Descargar sensibilidad CSV',df_sens.to_csv(index=False).encode('utf-8-sig'),'sensibilidad_geometrica_v162.csv','text/csv')
  st.info('No se reproduce el FS simplificado de GeologgIA: la estabilidad requiere comprobar cinemática, fuerzas y sostenimiento efectivo.')
 
 with tabs[6]:
- data={'version':'16.1','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
+ data={'version':'16.2','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
  st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v161.json','application/json')
  st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v161.csv','text/csv')
  st.caption('Exportaciones de datos geométricos preliminares. No constituyen informe de diseño.')
