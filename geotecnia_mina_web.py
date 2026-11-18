@@ -5,9 +5,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_geometrico_v17_4 import reconstruct_curved_block, connected_curved_components, compare_spatial_components, reconstruct_labeled_block
+from motor_geometrico_v17_4 import reconstruct_curved_block, connected_curved_components, compare_spatial_components, reconstruct_labeled_block, diagnose_independent_block
 
-st.set_page_config(page_title='Geotecnia Mina v17.4 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v17.5 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 [data-testid="stAlert"] p,[data-testid="stAlert"] span,[data-testid="stAlert"] div{color:#182337!important}
 .stButton button{color:#152235!important;font-weight:650!important}
@@ -33,7 +33,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v17.4 experimental')
+st.title('⛏️ GEOTECNIA MINA  ·  v17.5 experimental')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -228,7 +228,7 @@ if not visible:st.error('No se han identificado regiones con los parámetros act
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
-tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.4'])
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.5'])
 
 with tabs[0]:
  c1,c2,c3=st.columns([1.2,1,1])
@@ -542,11 +542,11 @@ with tabs[6]:
 
 
 with tabs[7]:
- st.subheader('Motor v17.4 · reconstrucción individual condicionada')
+ st.subheader('Motor v17.5 · reconstrucción individual condicionada')
  st.warning('MOTOR EXPERIMENTAL: la excavación se evalúa con su perfil curvo, pero el volumen se ESTIMA numéricamente. Una celda de planos puede contener varias componentes. No hay persistencia finita, prueba cinemática ni factor de seguridad. NO usar para dimensionamiento.')
  st.write(f"Bloque de referencia: **B{selected['id']}**, {selected['zone']} · volumen voxelizado {selected['volume']:.4f} m³")
 
- st.markdown('### Reconstrucción individual por etiqueta original (v17.4)')
+ st.markdown('### Reconstrucción individual por etiqueta original (v17.5)')
  st.caption('Cada bloque B mantiene su propia etiqueta. Se subdividen sus vóxeles y se comprueban nuevamente los planos y la bóveda curva. Esto evita asignar a B15 el volumen completo de la componente compartida, pero depende de la segmentación voxelizada original.')
  if st.button('Reconstruir volumen individual del bloque',key='v174_individual'):
   with st.spinner('Refinando el bloque seleccionado sin fusionarlo con otras etiquetas...'):
@@ -666,3 +666,58 @@ with tabs[7]:
   else:
    st.error(f"No se obtuvo una celda válida: {result['status']}")
    st.caption(result.get('detail',''))
+
+
+# v17.5: diagnóstico independiente de la etiqueta voxelizada.
+st.divider()
+st.header('🔬 Motor v17.5 · reconstrucción independiente y comparación 3D')
+st.caption('El modelo independiente reconstruye componentes a partir de planos y perfil de excavación. Las etiquetas B se emplean solo DESPUÉS para comparar. La geometría continúa discretizada y no incorpora persistencia finita ni liberación cinemática.')
+mode175=st.selectbox('Precisión del diagnóstico independiente',
+                     ['Rápida (30/45/60)','Alta (36/54/72)','Muy alta (48/72/96)'],
+                     index=1,key='v175_precision')
+if st.button('Analizar bloque y comparar geometrías',key='v175_run'):
+ with st.spinner('Reconstruyendo componentes sin imponer las etiquetas B...'):
+  rr={'Rápida (30/45/60)':(30,45,60),'Alta (36/54/72)':(36,54,72),
+      'Muy alta (48/72/96)':(48,72,96)}[mode175]
+  diag=diagnose_independent_block(selected,blocks,labels,xs,ys,zs,systems,nplanes,W,H,L,az,resolutions=rr)
+ if diag['status']!='ok':
+  st.error('No se pudo realizar el diagnóstico: '+diag['status'])
+ else:
+  a,b,c,d=st.columns(4)
+  a.metric('Volumen componente independiente',f"{diag['candidate_volume']:.4f} m³")
+  b.metric('Volumen B original',f"{selected['volume']:.4f} m³")
+  c.metric('Cobertura del bloque',f"{diag['coverage_pct']:.1f} %")
+  d.metric('Pureza de componente',f"{diag['purity_pct']:.1f} %")
+  st.dataframe(pd.DataFrame(diag['progress']).round(3),hide_index=True,use_container_width=True)
+  if diag['convergence_pct'] is not None:
+   st.write(f"Variación del volumen entre las dos últimas resoluciones: **{diag['convergence_pct']:.2f} %**")
+  if diag['ambiguous']:
+   st.error('CORRESPONDENCIA AMBIGUA: la componente reconstruida no puede atribuirse exclusivamente a este bloque. El volumen independiente NO es el volumen individual de B'+str(selected['id'])+'.')
+  else:
+   st.info('No se detecta ambigüedad importante en esta resolución. Esto NO valida geométricamente el bloque ni demuestra desprendimiento.')
+  if diag['collisions']:
+   st.markdown('**Otros bloques originales que comparten la componente reconstruida**')
+   st.dataframe(pd.DataFrame(diag['collisions']).round(3),hide_index=True,use_container_width=True)
+  st.markdown('#### Comparación 3D de las dos geometrías')
+  view175=st.radio('Mostrar', ['Ambas superpuestas','Solo original','Solo independiente'],horizontal=True,key='v175_view')
+  fig175=go.Figure()
+  def add_mask175(mask,color,opacity,name):
+   if not np.any(mask):return
+   padded=np.pad(mask.astype(np.uint8),1)
+   verts,faces,_,_=marching_cubes(padded,level=.5,spacing=(diag['step'],)*3)
+   verts+=diag['origin']-.5*diag['step']
+   fig175.add_trace(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],
+      i=faces[:,0],j=faces[:,1],k=faces[:,2],name=name,color=color,
+      opacity=opacity,flatshading=True,showlegend=True))
+  if view175!='Solo independiente':
+   add_mask175(diag['original_mask'],'#ffbf69',.45 if view175=='Ambas superpuestas' else .95,'B original remuestreado')
+  if view175!='Solo original':
+   add_mask175(diag['candidate_mask'],'#40d6b0',.65 if view175=='Ambas superpuestas' else .95,'Componente independiente')
+  fig175.update_layout(height=620,paper_bgcolor='#0b1421',font_color='#f1f5f9',
+      legend=dict(font=dict(color='white')),
+      scene=dict(bgcolor='#0b1421',aspectmode='data',
+        xaxis=dict(title='X (m)',color='white'),yaxis=dict(title='Y (m)',color='white'),
+        zaxis=dict(title='Z (m)',color='white')),
+      margin=dict(l=0,r=0,t=25,b=0))
+  st.plotly_chart(fig175,use_container_width=True)
+  st.warning('EXPERIMENTAL: independencia respecto a etiquetas no significa geometría exacta. Los planos se consideran infinitamente persistentes; no se evalúan mecanismos de caída, FS ni sostenimiento. No usar para dimensionamiento.')
