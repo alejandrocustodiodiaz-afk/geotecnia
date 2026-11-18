@@ -5,9 +5,10 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
+from motor_v18 import grid_diagnostic, synthetic_tests
 from motor_geometrico_v17_4 import reconstruct_curved_block, connected_curved_components, compare_spatial_components, reconstruct_labeled_block, diagnose_independent_block
 
-st.set_page_config(page_title='Geotecnia Mina v17.6 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v18 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Avisos: contraste legible incluso con tema oscuro */
 [data-testid="stAlert"]{border:1px solid #b5a36b!important}
@@ -37,7 +38,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v17.6 experimental')
+st.title('⛏️ GEOTECNIA MINA  ·  v18 experimental')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -232,7 +233,7 @@ if not visible:st.error('No se han identificado regiones con los parámetros act
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
-tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.5'])
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.5','🧬 Diagnóstico v18'])
 
 with tabs[0]:
  c1,c2,c3=st.columns([1.2,1,1])
@@ -751,3 +752,59 @@ if st.button('Analizar bloque y comparar geometrías',key='v175_run'):
   st.plotly_chart(fig175,use_container_width=True)
   st.caption('La malla interpolada se utiliza solo para visualizar. Los volúmenes se calculan con la discretización original de cada diagnóstico.')
   st.warning('EXPERIMENTAL: independencia respecto a etiquetas no significa geometría exacta. Los planos se consideran infinitamente persistentes; no se evalúan mecanismos de caída, FS ni sostenimiento. No usar para dimensionamiento.')
+
+
+# Motor v18: diagnóstico geométrico independiente y pruebas reproducibles.
+with tabs[8]:
+ st.header('🧬 Motor v18 · correspondencia espacial verificable')
+ st.info('La nueva herramienta no fuerza que una componente sea una cuña individual. Mide solapamiento espacial con las etiquetas originales y señala los límites del cálculo.')
+ choices={f"B{b['id']} · {b['zone']} · {b['volume']:.3f} m³":b for b in visible}
+ name=st.selectbox('Bloque a comprobar',list(choices),index=next((i for i,k in enumerate(choices) if k.startswith('B16 ')),0),key='v18block')
+ block18=choices[name]
+ r18=st.select_slider('Resolución de diagnóstico',options=[40,60,80,100],value=60,key='v18res')
+ st.caption('Se calcula una ventana local alrededor del bloque. Si la componente alcanza el borde de la ventana, el volumen es una cota parcial, NO un volumen total.')
+ if st.button('Ejecutar diagnóstico geométrico v18',key='v18go'):
+  with st.spinner('Calculando firmas de planos, componentes y solapamientos...'):
+   try:
+    result18=grid_diagnostic(block18,labels,xs,ys,zs,systems,nplanes,W,H,L,az,resolution=r18)
+   except Exception as exc:
+    st.error(f'No se completó el diagnóstico: {type(exc).__name__}: {exc}')
+    result18={'status':'error'}
+  if result18['status']!='ok':
+   st.error(f"Diagnóstico no disponible: {result18['status']}")
+  else:
+   chosen18=result18['chosen']
+   c1,c2,c3,c4=st.columns(4)
+   c1.metric('Componentes locales',result18['component_count'])
+   c2.metric('Solapamiento / cobertura',f"{result18['coverage_pct']:.1f} %")
+   c3.metric('Intersección / unión',f"{result18['iou_pct']:.1f} %")
+   c4.metric('Pureza componente',f"{chosen18['purity_pct']:.1f} %")
+   st.dataframe(pd.DataFrame([{k:v for k,v in comp.items() if k!='mask'} for comp in result18['components']]).round(4),hide_index=True,use_container_width=True)
+   st.write('**Firma de semiespacios de la región seleccionada**')
+   st.dataframe(pd.DataFrame([{'Plano':name,'Lado positivo':bool(bit)} for bit,(name,_,_) in zip(result18['signature'],result18['planes'])]),hide_index=True,use_container_width=True)
+   st.write(f"Volumen voxel original: **{result18['selected_voxel_m3']:.4f} m³** · original remuestreado: **{result18['original_resampled_m3']:.4f} m³** · componente en ventana: **{chosen18['volume_m3']:.4f} m³**")
+   if result18['window_touches']:
+    st.error('La componente alcanza el borde de la ventana local. Su volumen mostrado es PARCIAL; no es el volumen de la cuña.')
+   if chosen18['other_blocks']:
+    st.error('CORRESPONDENCIA NO EXCLUSIVA: esta componente incluye también '+chosen18['other_blocks']+'. No asignar su volumen al bloque seleccionado.')
+   elif result18['iou_pct']<80:
+    st.warning('La correspondencia espacial es insuficiente para validar la identidad del bloque.')
+   else:
+    st.info('Correspondencia espacial favorable en esta resolución, todavía sin validación geométrica ni cinemática.')
+   st.subheader('Comparación 3D en coordenadas comunes')
+   f18=go.Figure()
+   for mask18,color18,title18,opacity18 in [(result18['original_mask'],'#f7b955','Bloque voxel original',.48),(chosen18['mask'],'#34d6aa','Componente geométrica',.43)]:
+    if mask18.sum()>3:
+     v18,faces18,_,_=marching_cubes(np.pad(mask18.astype(np.float32),1),.5,spacing=(result18['step'],)*3)
+     v18+=result18['origin']-.5*result18['step']
+     f18.add_trace(go.Mesh3d(x=v18[:,0],y=v18[:,1],z=v18[:,2],i=faces18[:,0],j=faces18[:,1],k=faces18[:,2],color=color18,opacity=opacity18,name=title18,flatshading=True))
+   f18.update_layout(height=600,paper_bgcolor='#0b1421',font_color='#f1f5f9',margin=dict(l=0,r=0,t=20,b=0),scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white',nticks=4),yaxis=dict(title='Y (m)',color='white',nticks=4),zaxis=dict(title='Z (m)',color='white',nticks=4)))
+   st.plotly_chart(f18,use_container_width=True)
+   st.caption('Ambas superficies son isosuperficies discretizadas, no mallas analíticas exactas. No se calcula FS.')
+ st.divider()
+ if st.button('Ejecutar pruebas geométricas básicas',key='v18tests'):
+  try:
+   synthetic_tests()
+   st.success('Pruebas básicas superadas: orientación de normal y puntos de control dentro/fuera de herradura.')
+  except AssertionError:
+   st.error('Alguna prueba geométrica básica no se ha superado.')
