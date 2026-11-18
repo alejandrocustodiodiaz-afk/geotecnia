@@ -1,804 +1,595 @@
-"""Motor geométrico único de Geotecnia Mina v19 (experimental).
-
-Todas las rutinas de detección y diagnóstico viven aquí. La unificación
-NO constituye validación de volúmenes, liberación cinemática o FS.
-"""
-import json
-from scipy import ndimage as ndi
-
-"""Motor v17.1 experimental: celdas de discontinuidades + integración de bóveda curva.
-La superficie de excavación se evalúa con su ecuación curva exacta; el volumen se
-estima numéricamente mediante muestreo cuasi-Monte Carlo, NO es volumen exacto.
-No modela persistencia finita, liberación cinemática ni factor de seguridad.
-"""
+import io, json, math
 import numpy as np
-from scipy.optimize import linprog
-from scipy.spatial import HalfspaceIntersection, ConvexHull, QhullError
-from scipy.stats import qmc
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from scipy import ndimage as ndi
+from skimage.measure import marching_cubes, find_contours
+from motor_geotecnico import compute_regions, grid_diagnostic, synthetic_tests, test_region_invariants, compare_block_resolution
 
+st.set_page_config(page_title='Geotecnia Mina v25 · motor único', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.markdown("""<style>
+/* Avisos: contraste legible incluso con tema oscuro */
+[data-testid="stAlert"]{border:1px solid #b5a36b!important}
+[data-testid="stAlert"] p,[data-testid="stAlert"] span,[data-testid="stAlert"] div,
+[data-testid="stAlert"] [data-testid="stMarkdownContainer"] *{color:#1d2939!important}
+[data-testid="stAlert"] svg{color:#25374c!important}
+.stButton button{color:#152235!important;font-weight:650!important}
 
-def normal_local(dd, dip, az=0):
-    a, b = np.deg2rad([(dd-az) % 360, dip])
-    return np.array([np.sin(a)*np.sin(b), np.cos(a)*np.sin(b), np.cos(b)])
+/* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
+html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
+[data-testid="stSidebar"]{background:#101d2f!important}
+.stApp p,.stApp label,.stApp span,.stApp small,.stApp div[data-testid="stMarkdownContainer"],
+[data-testid="stWidgetLabel"] *,[data-testid="stCaptionContainer"] *,
+[data-testid="stSidebar"] p,[data-testid="stSidebar"] label,
+[data-testid="stMetricLabel"] *,[data-testid="stMetricValue"] *,
+[data-testid="stTabs"] button,[data-testid="stTabs"] button *{color:#eaf3ff!important}
+[data-testid="stCaptionContainer"],.stApp small{color:#c5d6eb!important}
+[data-testid="stMetric"]{background:#18283e;border:1px solid #47617f;border-radius:12px;padding:12px}
+[data-testid="stMetricValue"]{font-size:1.55rem!important;font-weight:750!important}
+[data-testid="stMetricLabel"]{font-weight:650!important}
+[data-testid="stNumberInput"] input,[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] [data-baseweb="select"] *,
+[data-testid="stNumberInput"] button{color:#142235!important}
+[data-testid="stSlider"] [data-testid="stTickBar"] *,[data-testid="stSlider"] [data-testid="stThumbValue"]{color:#ffffff!important}
+[data-testid="stTabs"] button{font-weight:700!important;font-size:.95rem!important}
+.stApp h1,.stApp h2,.stApp h3,.stApp h4{color:#fff!important}
+.block-container{padding-top:1rem;max-width:1750px}
+</style>""",unsafe_allow_html=True)
+COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
+st.title('⛏️ GEOTECNIA MINA  ·  v23 · auditoría coherente')
+st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
+st.warning('PROTOTIPO GEOMÉTRICO. Las regiones y sus superficies 3D se obtienen de la misma segmentación voxel, sin reconstrucciones visuales contradictorias. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
+# Carga de escenarios: antes de crear widgets para que sus valores se restauren.
+with st.expander('📁 Proyectos · guardar o recuperar escenario', expanded=False):
+    uploaded=st.file_uploader('Importar escenario JSON de Geotecnia Mina',type=['json'],key='scenario_upload')
+    if uploaded is not None and st.button('Aplicar escenario importado'):
+        try:
+            project=json.load(uploaded)
+            geo=project.get('geometria',{})
+            for key,source in [('w_input','W'),('h_input','H'),('l_input','L'),('az_input','azimut'),('gamma_input','gamma')]:
+                if source in geo: st.session_state[key]=float(geo[source])
+            for i,fam in enumerate(project.get('sistemas',[])[:3]):
+                for target,source in [('dd','dd'),('dip','dip'),('yy','yy'),('xx','xx'),('space','spacing'),('pers','persistence'),('phi','phi')]:
+                    if source in fam: st.session_state[f'{target}{i}']=float(fam[source])
+            st.session_state['loaded_project_support']=project.get('sostenimiento',{})
+            st.success('Escenario cargado. Comprueba los parámetros antes de interpretar resultados.')
+            st.rerun()
+        except (ValueError,TypeError,KeyError) as exc:
+            st.error(f'No se pudo importar el escenario: {exc}')
 
-def cell_halfspaces(systems, nplanes, W, H, L, az, sample):
-    """Semiespacios de la celda que contiene sample; límites de dominio incluidos."""
-    sample = np.asarray(sample, float)
-    halfspaces, names = [], []
-    for j, fam in enumerate(systems, 1):
-        n = normal_local(fam['dd'], fam['dip'], az)
-        base = float(n @ np.array([fam['xx'], fam['yy'], H]))
-        levels = [base+(k-(nplanes-1)/2)*fam['spacing'] for k in range(nplanes)]
-        # Solo las dos discontinuidades adyacentes pueden delimitar esta celda.
-        # Evita planos redundantes y permite atribuir correctamente las caras.
-        proj = float(n @ sample)
-        below = [(k, lev) for k, lev in enumerate(levels) if lev <= proj]
-        above = [(k, lev) for k, lev in enumerate(levels) if lev > proj]
-        if below:
-            k, lev = max(below, key=lambda t: t[1])
-            halfspaces.append(np.r_[-n, lev]); names.append(f'J{j} plano {k+1} (inferior)')
-        if above:
-            k, lev = min(above, key=lambda t: t[1])
-            halfspaces.append(np.r_[n, -lev]); names.append(f'J{j} plano {k+1} (superior)')
-    r = W/2; margin = max(2., W*.5)
-    for i, (lo, hi), name in zip(range(3), [(-r-margin,r+margin),(0,L),(0,H+margin)], ['X','Y','Z']):
-        unit = np.eye(3)[i]
-        halfspaces.extend([np.r_[-unit,lo], np.r_[unit,-hi]])
-        names.extend([f'Dominio {name} mínimo', f'Dominio {name} máximo'])
-    return np.asarray(halfspaces, float), names
+with st.sidebar:
+ st.header('⚙️ Geometría de la galería')
+ W=st.number_input('Ancho (m)',2.,20.,5.8,.1,key='w_input')
+ H=st.number_input('Alto (m)',2.,20.,5.8,.1,key='h_input')
+ L=st.number_input('Longitud analizada (m)',5.,40.,15.,1.,key='l_input')
+ az=st.number_input('Azimut del eje (° desde N)',0.,359.9,0.,1.,key='az_input')
+ gamma=st.number_input('Peso específico roca (kN/m³)',15.,40.,26.4,.1,key='gamma_input')
+ res=st.slider('Resolución de detección de regiones',36,90,60,6)
+ nplanes=st.slider('Planos paralelos por familia',1,4,2)
+ minvol=st.number_input('Volumen mínimo mostrado (m³)',0.,20.,.05,.05)
+ st.divider()
+ st.header('🧱 Sostenimiento')
+ typ=st.selectbox('Tipo', ['ST-I','ST-II','ST-III','ST-IV superficial','ST-IV profundo','Personalizado'],index=2)
+ presets={'ST-I':(2.4,2.,.03,0.,False),'ST-II':(2.4,2.,.03,0.,False),'ST-III':(2.4,1.5,.08,0.,True),'ST-IV superficial':(2.4,1.5,.12,8.,True),'ST-IV profundo':(2.4,1.5,.15,10.,True),'Personalizado':(2.4,1.5,.08,0.,True)}
+ bl,bs,shot,cl,mesh=presets[typ]
+ boltlen=st.number_input('Longitud pernos (m)',.5,15.,bl,.1)
+ boltspace=st.number_input('Separación pernos (m)',.5,5.,bs,.1)
+ shot=st.number_input('Espesor gunita (m)',0.,.5,shot,.01)
+ cablelen=st.number_input('Longitud cables (m)',0.,20.,cl,.5)
+ mesh=st.checkbox('Malla metálica',value=mesh)
+ show_bolts=True # La visibilidad real se controla en el visor 3D
+ st.caption('La representación de sostenimiento es geométrica; no implica capacidad resistente verificada.')
 
+r=W/2.; spring=max(0.,H-r)
+theta=np.linspace(np.pi,0,100)
+section=np.vstack(([-r,0],[-r,spring],np.column_stack((r*np.cos(theta),spring+r*np.sin(theta))),[r,0]))
 
-def convex_polyhedron(halfspaces):
-    A = halfspaces[:,:3]; d = halfspaces[:,3]
-    norms = np.linalg.norm(A, axis=1)
-    res = linprog([0,0,0,-1], A_ub=np.column_stack([A,norms]), b_ub=-d,
-                  bounds=[(None,None)]*4, method='highs')
-    if not res.success or res.x[3] < 1.e-8:
-        return {'status':'empty_or_degenerate','detail':res.message}
-    try:
-        hs = HalfspaceIntersection(halfspaces, res.x[:3], qhull_options='Qx')
-        vertices = np.unique(np.round(hs.intersections, 10), axis=0)
-        hull = ConvexHull(vertices)
-    except (QhullError, ValueError) as exc:
-        return {'status':'geometry_error','detail':str(exc)}
-    return {'status':'ok','vertices':vertices,'faces':hull.simplices,
-            'volume':float(hull.volume),'area':float(hull.area),
-            'interior':res.x[:3], 'clearance':float(res.x[3])}
+def normal(dd,dip):
+ a=np.deg2rad(dd);b=np.deg2rad(dip)
+ return np.array([np.sin(a)*np.sin(b),np.cos(a)*np.sin(b),np.cos(b)])
+def angular(a,b):
+ return float(np.rad2deg(np.arccos(np.clip(abs(np.dot(a,b)/(np.linalg.norm(a)*np.linalg.norm(b))),0,1))))
+def pole(dd,dip,projection):
+ # Hemisferio inferior: polo opuesto a la normal ascendente.
+ trend=np.deg2rad((dd+180)%360); plunge=90-dip
+ rad=np.sqrt(2)*np.sin(np.deg2rad((90-plunge)/2)) if projection=='Schmidt (igual área)' else np.tan(np.deg2rad((90-plunge)/2))
+ return rad*np.sin(trend),rad*np.cos(trend)
+def great_circle(dd,dip,projection):
+ n=normal(dd,dip); v=np.array([0.,0.,1.]);u=np.cross(n,v)
+ if np.linalg.norm(u)<1e-7:u=np.array([1.,0.,0.])
+ u=u/np.linalg.norm(u);v=np.cross(n,u);v=v/np.linalg.norm(v)
+ pts=[]
+ for t in np.linspace(0,2*np.pi,361):
+  p=u*np.cos(t)+v*np.sin(t)
+  if p[2]>0:p=-p
+  plunge=np.rad2deg(np.arcsin(np.clip(-p[2],0,1)))
+  trend=np.arctan2(p[0],p[1]);rad=np.sqrt(2)*np.sin(np.deg2rad((90-plunge)/2)) if projection=='Schmidt (igual área)' else np.tan(np.deg2rad((90-plunge)/2))
+  pts.append((rad*np.sin(trend),rad*np.cos(trend)))
+ return np.array(pts)
 
+def tunnel_surface(section,y0,y1):
+    # Superficie interior de la excavación extruida: no se cierra el piso.
+    v0=np.column_stack([section[:,0],np.full(len(section),y0),section[:,1]])
+    v1=np.column_stack([section[:,0],np.full(len(section),y1),section[:,1]])
+    verts=np.vstack([v0,v1]); n=len(section)
+    faces=[]
+    for k in range(n-1):
+        faces.append([k,k+1,k+n]);faces.append([k+1,k+n+1,k+n])
+    return verts,np.asarray(faces)
 
-def outside_horseshoe(points, W, H):
-    """Puntos de roca, fuera del hueco de herradura extruido (solera incluida)."""
-    x, z = points[:,0], points[:,2]
-    r = W/2.; spring = max(0., H-r)
-    in_void = (np.abs(x) <= r) & ((z <= spring) | (x*x+(z-spring)**2 <= r*r))
-    return ~in_void
+def intersection_orientation(a,b):
+    # Dos planos: dirección de la recta, no prueba de liberación.
+    u=np.cross(normal(a['dd'],a['dip']),normal(b['dd'],b['dip']))
+    if np.linalg.norm(u)<1e-8:return None
+    u=u/np.linalg.norm(u)
+    if u[2]>0:u=-u
+    return (float(np.degrees(np.arctan2(u[0],u[1]))%360),float(np.degrees(np.arcsin(np.clip(-u[2],-1,1)))))
 
+with st.expander('📐 Familias de discontinuidades · editar orientación y posición',expanded=True):
+ cols=st.columns(3);systems=[]
+ for i,col in enumerate(cols):
+  with col:
+   st.markdown(f'**Familia J{i+1}**')
+   dd=st.number_input('Dirección de buzamiento (°)',0.,359.9,[30.,150.,270.][i],key=f'dd{i}')
+   dip=st.number_input('Buzamiento (°)',0.,90.,60.,key=f'dip{i}')
+   yy=st.number_input('Paso longitudinal (m)',0.,L,L*(.4+.1*i),key=f'yy{i}')
+   xx=st.number_input('Paso transversal (m)',-W,W,0.,key=f'xx{i}')
+   spacing=st.number_input('Espaciado (m)',.1,20.,2.,key=f'space{i}')
+   persistence=st.number_input('Persistencia registrada (m)',.1,50.,5.,key=f'pers{i}')
+   phi=st.number_input('Fricción de junta (°)',0.,70.,30.,key=f'phi{i}')
+   systems.append(dict(dd=dd,dip=dip,yy=yy,xx=xx,spacing=spacing,persistence=persistence,phi=phi))
 
-def _tetra_sampling(vertices, faces, interior, n, seed):
-    """Muestreo uniforme de un poliedro convexo, triangulado desde un punto interior."""
-    tri = vertices[faces]
-    edges = tri[:,1:,:] - tri[:,:1,:]
-    cross = np.cross(edges[:,0,:], edges[:,1,:])
-    vol = np.abs(np.einsum('ij,ij->i',cross,tri[:,0,:]-interior))/6.
-    good = vol > 1.e-13
-    tri, vol = tri[good], vol[good]
-    if len(vol) == 0: raise ValueError('No hay tetraedros de volumen positivo')
-    cum = np.cumsum(vol)/vol.sum()
-    m = int(np.log2(n))
-    u = qmc.Sobol(d=5, scramble=True, seed=seed).random_base2(m)
-    ids = np.searchsorted(cum, u[:,0], side='right')
-    ids = np.minimum(ids, len(tri)-1)
-    weights = -np.log(np.clip(u[:,1:], 1.e-14, 1.))
-    weights /= weights.sum(axis=1,keepdims=True)
-    pts = (weights[:,0,None]*interior[None,:]
-           + np.einsum('ni,nij->nj', weights[:,1:], tri[ids]))
-    return pts
+@st.cache_data(show_spinner=False,max_entries=3)
+def compute(W,H,L,az,res,nplanes,systems_json):
+ return compute_regions(W,H,L,az,res,nplanes,systems_json)
 
+@st.cache_data(show_spinner=False,max_entries=50)
+def surface(labels,ident,dx,dy,dz,x0,y0,z0):
+ mask=np.pad((labels==ident).astype(np.uint8),1)
+ if not mask.any():return None
+ verts,faces,_,_=marching_cubes(mask,.5,spacing=(dx,dy,dz));verts+=np.array([x0-dx,y0-dy,z0-dz]);return verts,faces
 
-def _face_diagnostics(vertices, faces, halfspaces, names, tolerance=1.e-5):
-    face_info=[]
-    for i,(h,name) in enumerate(zip(halfspaces,names)):
-        dist = np.abs(vertices @ h[:3]+h[3])/max(np.linalg.norm(h[:3]),1.e-12)
-        count = int(np.count_nonzero(dist < tolerance))
-        if count >= 3:
-            face_info.append({'Plano delimitante':name,'Vértices sobre plano':count,
-                              'Tipo':'Límite artificial' if name.startswith('Dominio') else 'Discontinuidad'})
-    return face_info
+@st.cache_data(show_spinner=False,max_entries=35)
+def surface_analytic(labels,ident,xs,ys,zs,W,H,L,az,nplanes,systems_json,quality):
+ # Reconstrucción subvoxel por campos implícitos de los planos y la herradura.
+ # La detección y clasificación del bloque siguen siendo aproximadas.
+ idx=np.argwhere(labels==ident)
+ if len(idx)<5:return None
+ systems=json.loads(systems_json)
+ dx,dy,dz=xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0]
+ lo=idx.min(axis=0);hi=idx.max(axis=0)
+ margin=np.array([max(dx*2,.30),max(dy*2,.30),max(dz*2,.30)])
+ mins=np.maximum([xs[0],ys[0],zs[0]],[xs[lo[0]]-margin[0],ys[lo[1]]-margin[1],zs[lo[2]]-margin[2]])
+ maxs=np.minimum([xs[-1],ys[-1],zs[-1]],[xs[hi[0]]+margin[0],ys[hi[1]]+margin[1],zs[hi[2]]+margin[2]])
+ nside=int(quality)
+ lengths=maxs-mins
+ # Isotropic spacing, capped to keep interactive performance.
+ step=max(float(max(lengths)/nside),.035)
+ dims=np.maximum(5,np.ceil(lengths/step).astype(int)+1)
+ dims=np.minimum(dims,140)
+ axes=[np.linspace(mins[i],maxs[i],dims[i]) for i in range(3)]
+ X,Y,Z=np.meshgrid(*axes,indexing='ij')
+ center=np.array([xs[idx[:,0]].mean(),ys[idx[:,1]].mean(),zs[idx[:,2]].mean()])
+ field=np.full(X.shape,-np.inf,dtype=np.float32)
+ for fam in systems:
+  n=normal((fam['dd']-az)%360,fam['dip'])
+  base=np.dot(n,[fam['xx'],fam['yy'],H])
+  for k in range(nplanes):
+   off=(k-(nplanes-1)/2)*fam['spacing']
+   signed=n[0]*X+n[1]*Y+n[2]*Z-base-off
+   side=1. if (np.dot(n,center)-base-off)>=0 else -1.
+   np.maximum(field,-side*signed,out=field)
+ r=W/2.;spring=max(0.,H-r)
+ # Distancia exterior aproximada a herradura: frontera exacta de hastiales y arco.
+ outside=np.where(Z<=spring,np.abs(X)-r,np.sqrt(X*X+(Z-spring)**2)-r)
+ np.maximum(field,-outside,out=field)
+ # Límite de dominio; para regiones cerradas no debe cortar el sólido.
+ for coord,lower,upper in [(X,xs[0],xs[-1]),(Y,ys[0],ys[-1]),(Z,zs[0],zs[-1])]:
+  np.maximum(field,lower-coord,out=field)
+  np.maximum(field,coord-upper,out=field)
+ if not (np.nanmin(field)<0<np.nanmax(field)):return None
+ verts,faces,_,_=marching_cubes(field,level=0.,spacing=tuple(float(a[1]-a[0]) for a in axes))
+ verts+=mins
+ # La caja de muestreo no debe generar tapas artificiales.
+ eps=step*1.1
+ on_box=np.any((verts<=mins+eps)|(verts>=maxs-eps),axis=1)
+ return verts,faces,float(np.mean(on_box))
 
+with st.spinner('Calculando regiones de roca adyacentes a la excavación...'):
+ xs,ys,zs,labels,blocks=compute(W,H,L,az,res,nplanes,json.dumps(systems,sort_keys=True))
+visible=[b for b in blocks if b['volume']>=minvol]
+closed=[b for b in visible if not b['open']]
+if not visible:st.error('No se han identificado regiones con los parámetros actuales.');st.stop()
 
-def reconstruct_curved_block(block, systems, nplanes, W, H, L, az,
-                             powers=(12,14,16), repeats=4):
-    """Volumen de la celda convexa FUERA de la herradura curva, estimado con Sobol.
-    Una celda puede contener varias componentes: no garantiza correspondencia con
-    una componente voxelizada, ni continuidad o liberación cinemática.
-    """
-    sample=np.asarray(block['center'],float)
-    hs,names=cell_halfspaces(systems,nplanes,W,H,L,az,sample)
-    poly=convex_polyhedron(hs)
-    if poly['status'] != 'ok': return poly
-    vertices,faces=poly['vertices'],poly['faces']
-    estimates=[]; progress=[]
-    for power in powers:
-        vals=[]
-        for rep in range(repeats):
-            pts=_tetra_sampling(vertices,faces,poly['interior'],2**power,seed=7919+power*41+rep)
-            vals.append(float(poly['volume']*outside_horseshoe(pts,W,H).mean()))
-        progress.append({'Muestras por réplica':2**power,'Volumen medio (m³)':float(np.mean(vals)),
-                         'Desviación entre réplicas (m³)':float(np.std(vals,ddof=1)) if repeats>1 else np.nan})
-        estimates=vals
-    volume=float(np.mean(estimates))
-    sd=float(np.std(estimates,ddof=1)) if repeats>1 else float('nan')
-    return {**poly, 'status':'ok', 'volume_convex_cell':poly['volume'],
-            'volume_curved_estimate':volume,'replicate_sd':sd,
-            'relative_difference':float(volume/block['volume']-1) if block['volume'] else None,
-            'progress':progress,'faces_diagnostic':_face_diagnostics(vertices,faces,hs,names),
-            'note':'Volumen numérico de TODA la porción exterior de la celda; no necesariamente la misma componente voxelizada.'}
+m1,m2,m3,m4=st.columns(4)
+m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','⚙️ Motor geotécnico'])
 
+with tabs[0]:
+ c1,c2,c3=st.columns([1.2,1,1])
+ with c1:
+  options=sorted(visible,key=lambda b:(b['open'],-b['volume']))
+  selected=st.selectbox('Región seleccionada',options,format_func=lambda b:f"B{b['id']} · {b['zone']} · {b['volume']:.2f} m³ · {'abierta' if b['open'] else 'cerrada'}")
+ with c2:mode=st.radio('Mostrar regiones', ['Todas las regiones','Todas las cerradas','Solo seleccionada'],horizontal=False,help='Abiertas/cerradas se refiere al borde del dominio, no a la estabilidad')
+ with c3:
+  scale=st.slider('Escala de análisis de cuña',.5,2.,1.,.05)
+  focus=st.checkbox('Acercar cámara a la cuña',False)
+  isolate=st.checkbox('Aislar cuña seleccionada (ocultar galería y otras regiones)',False)
+  identify=st.checkbox('Identificar bloques con etiquetas B',True)
+  quality=st.slider('Calidad de superficie 3D',55,115,85,10)
+ st.markdown('#### 👁️ Herramientas de visualización 3D')
+ with st.expander('Mostrar / ocultar elementos, etiquetas y cámara',expanded=True):
+  vc1,vc2,vc3=st.columns(3)
+  with vc1:
+   view_tunnel=st.checkbox('Galería',True,key='view_tunnel')
+   view_wedge=st.checkbox('Cuñas',True,key='view_wedge')
+   st.caption('Trazas J1–J3: pendientes de implementación geométrica')
+  with vc2:
+   view_bolts=st.checkbox('Pernos',True,key='view_bolts')
+   view_cables=st.checkbox('Cables',True,key='view_cables')
+   view_axes=st.checkbox('Ejes y números',True,key='view_axes')
+  with vc3:
+   view_grid=st.checkbox('Cuadrícula',False,key='view_grid')
+   view_labels=st.checkbox('Títulos de ejes',True,key='view_labels')
+   label_size=st.slider('Tamaño de números',12,24,17,1,key='label_size')
+  camera_view=st.selectbox('Vista de cámara',['Isométrica','Frontal','Lateral','Superior','Centrar cuña'],key='camera_view')
+  st.caption('Para examinar B15/B16: selecciona el bloque, activa Aislar y escoge Centrar cuña. Puedes ocultar ejes y números.')
+  if st.button('Restablecer visualización',key='reset_view'):
+   for k,v in {'view_tunnel':True,'view_wedge':True,'view_bolts':True,'view_cables':True,'view_axes':True,'view_grid':False,'view_labels':True,'label_size':17,'camera_view':'Isométrica'}.items():st.session_state[k]=v
+   st.rerun()
+ st.caption(f'**Regiones disponibles:** {len(visible)} en contacto; {len(closed)} cerradas y {len(visible)-len(closed)} abiertas. El modo «Todas las regiones» permite comparar su ubicación, pero no indica que sean cuñas desprendibles.')
+ st.caption('Escala: transforma una copia visual de la región seleccionada alrededor de su centro; el volumen de escenario se multiplica por escala³. No modifica los planos ni representa una cuña geológicamente demostrada.')
+ a,b,c,d=st.columns(4)
+ a.metric('Volumen geométrico',f"{selected['volume']:.3f} m³")
+ b.metric('Peso geométrico',f"{selected['volume']*gamma:.1f} kN")
+ c.metric('Volumen escalado',f"{selected['volume']*scale**3:.3f} m³")
+ d.metric('Peso escalado',f"{selected['volume']*gamma*scale**3:.1f} kN")
+ fig=go.Figure();ymin=max(0,selected['contact'][1]-2.5) if focus else 0;ymax=min(L,selected['contact'][1]+2.5) if focus else L
+ tv,tf=tunnel_surface(section,ymin,ymax)
+ if view_tunnel and not isolate:fig.add_trace(go.Mesh3d(x=tv[:,0],y=tv[:,1],z=tv[:,2],i=tf[:,0],j=tf[:,1],k=tf[:,2],color='#81b8e6',opacity=.16,flatshading=True,hoverinfo='skip',name='Galería'))
+ if view_tunnel and not isolate:
+  for y in [ymin,ymax]:fig.add_trace(go.Scatter3d(x=section[:,0],y=np.full(len(section),y),z=section[:,1],mode='lines',line=dict(color='#a2b6ca',width=5),showlegend=False,hoverinfo='skip'))
+ if view_tunnel and not isolate:
+  for x,z in section[::8]:fig.add_trace(go.Scatter3d(x=[x,x],y=[ymin,ymax],z=[z,z],mode='lines',line=dict(color='#9cc7ed',width=3),showlegend=False,hoverinfo='skip'))
+ shown=([selected] if isolate else ([selected] if mode=='Solo seleccionada' else ([v for v in visible if not v['open']] if mode=='Todas las cerradas' else visible))) if view_wedge else []
+ shown=sorted(shown,key=lambda b:(b['id']!=selected['id'],-b['volume']))[:35]
+ st.caption(f'**Visualización 3D:** {len(shown)} de {len(visible) if mode=="Todas las regiones" else len(closed) if mode=="Todas las cerradas" else 1} regiones del filtro. Verde = seleccionada; otros colores = regiones adicionales. Máximo 35 para mantener fluidez.')
+ for j,v in enumerate(shown):
+  result=(surface_analytic(labels,v['id'],xs,ys,zs,W,H,L,az,nplanes,json.dumps(systems,sort_keys=True),quality) if not v['open'] else None)
+  if result is None:result=surface(labels,v['id'],xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0],xs[0],ys[0],zs[0]);
+  if result is None:continue
+  verts,faces=result[:2]
+  if v['id']==selected['id'] and scale!=1:verts=(verts-np.array(v['center']))*scale+np.array(v['center'])
+  color='#34e3a4' if v['id']==selected['id'] else {'Bóveda':'#f6bb54','Hastial izq.':'#63b3ed','Hastial der.':'#e99ed8'}.get(v['zone'],COL[j%len(COL)])
+  fig.add_trace(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color=color,opacity=.86 if v['id']==selected['id'] else (.24 if v['open'] else .58),name=f"B{v['id']}",flatshading=True,lighting=dict(ambient=.55,diffuse=.85,specular=.35,roughness=.35,fresnel=.1),hovertemplate=f"B{v['id']} · {v['zone']}<br>{v['volume']:.2f} m³<br>{'Abierta al borde' if v['open'] else 'Cerrada en dominio'}<extra></extra>"))
+  if identify:
+   # Marcador situado en el centro de la región, con texto independiente del hover.
+   center=np.asarray(v['center'])
+   fig.add_trace(go.Scatter3d(x=[center[0]],y=[center[1]],z=[center[2]],mode='markers+text',
+     marker=dict(size=5,color='#ffffff',line=dict(color='#101d2f',width=1)),
+     text=[f"B{v['id']}"],textposition='top center',textfont=dict(size=15,color='#ffffff'),
+     showlegend=False,hoverinfo='skip'))
+ def bolts():
+  # Anclajes radiales simplificados: puntos en bóveda y hastiales, con estaciones longitudinales.
+  arc=np.linspace(np.pi-.12,.12,max(5,round(np.pi*r/boltspace)+1))
+  stations=np.arange(boltspace/2,L,boltspace)
+  for y in stations:
+   for t in arc:
+    p=np.array([r*np.cos(t),y,spring+r*np.sin(t)]);out=np.array([np.cos(t),0.,np.sin(t)])
+    yield p,out,boltlen,'Perno'
+   for side in [-1,1]:
+    for z in np.arange(boltspace/2,spring,boltspace):yield np.array([side*r,y,z]),np.array([side,0.,0.]),boltlen,'Perno'
+   if cablelen>0:
+    for t in np.linspace(np.pi-.25,.25,5):yield np.array([r*np.cos(t),y,spring+r*np.sin(t)]),np.array([np.cos(t),0.,np.sin(t)]),cablelen,'Cable'
+ def intersection(p,q,ident):
+  delta=min(xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0])/2
+  n=max(3,int(np.linalg.norm(q-p)/delta)+1);t=np.linspace(0,1,n);pts=p[None,:]+t[:,None]*(q-p)[None,:]
+  ix=np.rint((pts[:,0]-xs[0])/(xs[1]-xs[0])).astype(int);iy=np.rint((pts[:,1]-ys[0])/(ys[1]-ys[0])).astype(int);iz=np.rint((pts[:,2]-zs[0])/(zs[1]-zs[0])).astype(int)
+  ok=(ix>=0)&(ix<len(xs))&(iy>=0)&(iy<len(ys))&(iz>=0)&(iz<len(zs));inside=np.zeros(n,bool);inside[ok]=labels[ix[ok],iy[ok],iz[ok]]==ident
+  if not inside.any():return False,0.
+  last=np.flatnonzero(inside)[-1];return True,float(np.linalg.norm(q-p)*(1-t[last]))
+ hits=[]
+ if (view_bolts or view_cables) and not isolate:
+  for p,out,length,kind in bolts():
+   if (kind=='Perno' and not view_bolts) or (kind=='Cable' and not view_cables):continue
+   q=p+out*length
+   if focus and not(ymin-.2<=p[1]<=ymax+.2):continue
+   hit,tail=intersection(p,q,selected['id']);hits.append((kind,hit,tail))
+   fig.add_trace(go.Scatter3d(x=[p[0],q[0]],y=[p[1],q[1]],z=[p[2],q[2]],mode='lines',line=dict(color=('#e8a34d' if hit else '#4c789e') if kind=='Perno' else '#c68bf0',width=5 if hit else 2),showlegend=False,hoverinfo='skip'))
+ # Encuadre local de la región, evitando el gran vacío del visor anterior.
+ cx,cy,cz=selected['center'] if (focus or isolate or camera_view=='Centrar cuña') else selected['contact'];span=max(W*.7,H*.7,3.0) if (focus or isolate or camera_view=='Centrar cuña') else max(W,H,L)
+ xr=[cx-span*.65,cx+span*.65] if (focus or isolate or camera_view=='Centrar cuña') else [xs[0],xs[-1]]
+ yr=[max(0,cy-span*.7),min(L,cy+span*.7)] if (focus or isolate or camera_view=='Centrar cuña') else [0,L]
+ zr=[max(0,cz-span*.65),min(zs[-1],cz+span*.65)] if (focus or isolate or camera_view=='Centrar cuña') else [0,zs[-1]]
+ # Plotly: texto grande y blanco, cuadrícula opcional y cámara configurable.
+ cameras={'Isométrica':dict(x=1.4,y=-1.7,z=1.15),'Frontal':dict(x=0,y=-2.5,z=.55),
+          'Lateral':dict(x=2.5,y=0,z=.35),'Superior':dict(x=.01,y=-.01,z=2.8),
+          'Centrar cuña':dict(x=1.35,y=-1.6,z=1.05)}
+ def axis_style(title,rng):
+  return dict(title=dict(text=title if view_labels else '',font=dict(size=label_size+1,color='#ffffff')),
+              range=rng,visible=view_axes,showticklabels=view_axes,
+              tickfont=dict(size=label_size,color='#ffffff'),tickcolor='#ffffff',
+              showgrid=view_grid,gridcolor='#50647e',gridwidth=1,
+              showbackground=False,zeroline=False,ticks='outside',ticklen=5,
+              nticks=4)
+ fig.update_layout(height=780,margin=dict(l=0,r=0,t=0,b=0),paper_bgcolor='#0b1421',
+     font=dict(color='#ffffff',size=label_size),
+     scene=dict(domain=dict(x=[0,1],y=[0,1]),bgcolor='#0b1421',
+                xaxis=axis_style('Transversal X (m)',xr),
+                yaxis=axis_style('Eje Y (m)',yr),
+                zaxis=axis_style('Altura Z (m)',zr),
+                aspectmode='data',camera=dict(eye=cameras[camera_view],
+                    projection=dict(type='orthographic'))),showlegend=False)
 
-def connected_curved_components(block, systems, nplanes, W, H, L, az,
-                                resolutions=(48, 72, 96), connectivity=1):
-    """Experimental grid-based connected components of rock within a plane cell.
+ st.plotly_chart(fig,use_container_width=True)
+ # Diagnóstico explícito de bordes: basado en los mismos vóxeles que la clasificación.
+ mask=(labels==selected['id'])
+ borders=[]
+ for touched,label in [(mask[0,:,:].any(),'X mínimo'),(mask[-1,:,:].any(),'X máximo'),
+                       (mask[:,0,:].any(),'Y inicial'),(mask[:,-1,:].any(),'Y final'),
+                       (mask[:,:,0].any(),'Z inferior'),(mask[:,:,-1].any(),'Z superior')]:
+  if touched:borders.append(label)
+ idx=np.argwhere(mask)
+ if len(idx):
+  mins=np.array([xs[idx[:,0].min()],ys[idx[:,1].min()],zs[idx[:,2].min()]])
+  maxs=np.array([xs[idx[:,0].max()],ys[idx[:,1].max()],zs[idx[:,2].max()]])
+  extents=maxs-mins
+  st.markdown(f"**Diagnóstico B{selected['id']}:** {'Abierta al dominio' if borders else 'Cerrada en dominio'} · ",unsafe_allow_html=False)
+  st.write('Bordes alcanzados:', ', '.join(borders) if borders else 'Ninguno de los seis límites del dominio discretizado')
+  st.write(f'Dimensiones aproximadas de su caja envolvente (X × Y × Z): **{extents[0]:.2f} × {extents[1]:.2f} × {extents[2]:.2f} m**. Son extensiones voxelizadas, no dimensiones verificadas de una cuña.')
+  if mode=='Todas las cerradas' and len(closed)>1:
+   st.caption('Si solo distingues una cuña, utiliza «Aislar cuña seleccionada» y alterna entre B15 y B16: pueden solaparse en proyección o una puede quedar oculta.')
+ st.caption('Galería azul semitransparente, región seleccionada verde; otras regiones en amarillo (bóveda), azul (hastial izquierdo) o rosa (derecho).')
+ st.caption('Superficie 3D reconstruida mediante ecuaciones de planos y sección de herradura para regiones cerradas; identificación del bloque aún basada en vóxeles. Las caras y volúmenes necesitan verificación geométrica independiente.')
+ st.info('La clasificación abierta/cerrada se refiere exclusivamente a los límites del dominio discretizado. No se ha comprobado la liberación cinemática ni la estabilidad.')
+ if view_bolts or view_cables:
+  h=[x for x in hits if x[1]]
+  st.write(f"**Intersecciones geométricas aproximadas con B{selected['id']}:** {len(h)} de {len(hits)} elementos representados en la ventana 3D.")
+  if h:st.write(f"Longitud exterior tras la última intersección: mínimo **{min(x[2] for x in h):.2f} m**. No equivale a longitud de anclaje efectiva verificada.")
 
-    Identifies the component containing (or nearest to) the selected voxel-block
-    centroid. This is a diagnostic, NOT an exact mesh or a validated wedge volume.
-    """
-    from scipy import ndimage as ndi
-    sample = np.asarray(block['center'], dtype=float)
-    hs, names = cell_halfspaces(systems, nplanes, W, H, L, az, sample)
-    poly = convex_polyhedron(hs)
-    if poly['status'] != 'ok':
-        return poly
-    low = poly['vertices'].min(axis=0)
-    high = poly['vertices'].max(axis=0)
-    span = high - low
-    if np.any(span <= 1e-9):
-        return {'status': 'degenerate_bounds'}
-    results = []
-    last_mask = None
-    last_origin = None
-    last_step = None
-    last_components = []
-    for resolution in resolutions:
-        # Isotropic cells; the longest box dimension has 'resolution' cells.
-        step = float(np.max(span) / int(resolution))
-        shape = np.maximum(3, np.ceil(span / step).astype(int))
-        axes = [low[i] + (np.arange(shape[i]) + .5) * step for i in range(3)]
-        xx, yy, zz = np.meshgrid(*axes, indexing='ij', sparse=True)
-        mask = np.ones(tuple(shape), dtype=bool)
-        # Evaluate each halfspace without constructing a large (N,3) point array.
-        for h in hs:
-            mask &= (h[0]*xx + h[1]*yy + h[2]*zz + h[3] <= 1e-9)
-        r = W / 2.
-        spring = max(0., H-r)
-        void = (np.abs(xx) <= r) & ((zz <= spring) | (xx*xx+(zz-spring)**2 <= r*r))
-        mask &= ~void
-        structure = ndi.generate_binary_structure(3, connectivity)
-        labels, n_components = ndi.label(mask, structure=structure)
-        counts = np.bincount(labels.ravel(), minlength=n_components+1)
-        counts[0] = 0
-        # Associate the selected voxel centroid to one connected component.
-        # If centroid falls on a grid boundary, select nearest occupied cell,
-        # but report that the association was inferred rather than exact.
-        center_index = np.rint((sample - low) / step - .5).astype(int)
-        center_index = np.clip(center_index, 0, shape-1)
-        selected_label = int(labels[tuple(center_index)])
-        association = 'centroid_inside_component'
-        distance = 0.
-        if selected_label == 0:
-            candidates = np.argwhere(labels > 0)
-            if len(candidates):
-                deltas = (candidates + .5) * step + low - sample
-                nearest = int(np.argmin(np.einsum('ij,ij->i', deltas, deltas)))
-                cell = candidates[nearest]
-                distance = float(np.linalg.norm(deltas[nearest]))
-                selected_label = int(labels[tuple(cell)])
-                association = 'nearest_component_inferred'
-            else:
-                association = 'no_rock_cells'
-        component_count = int(counts[selected_label]) if selected_label else 0
-        selected_volume = component_count * step**3
-        total_volume = int(mask.sum()) * step**3
-        components = sorted(({'label':int(i), 'volume_m3':float(counts[i]*step**3),
-                              'cell_count':int(counts[i])} for i in range(1,n_components+1)),
-                            key=lambda item: -item['volume_m3'])
-        results.append({'Resolución':int(resolution), 'Celdas X/Y/Z': '×'.join(map(str,shape)),
-                        'Componentes':int(n_components),
-                        'Volumen componente (m³)':float(selected_volume),
-                        'Volumen total (m³)':float(total_volume),
-                        'Asociación':association,
-                        'Distancia centro (m)':distance})
-        last_mask = (labels == selected_label) if selected_label else np.zeros_like(mask)
-        last_origin = low.copy()
-        last_step = step
-        last_components = components
-    return {'status':'ok', 'progress':results, 'components':last_components,
-            'selected_component_volume':results[-1]['Volumen componente (m³)'],
-            'total_volume':results[-1]['Volumen total (m³)'],
-            'association':results[-1]['Asociación'],
-            'association_distance':results[-1]['Distancia centro (m)'],
-            'component_mask':last_mask, 'grid_origin':last_origin,
-            'grid_step':last_step, 'halfspace_names':names,
-            'warning':'Discretización experimental; las componentes pueden fusionarse o desaparecer al cambiar resolución.'}
+with tabs[1]:
+ st.subheader('Estereograma · selección de polos y medición angular')
+ a,b,c=st.columns(3)
+ with a:projection=st.selectbox('Proyección',['Schmidt (igual área)','Wulff (igual ángulo)'])
+ with b:reference=st.selectbox('Plano de referencia',['Muro de cámara','Techo de cámara','Hastial de galería','Plano personalizado'])
+ with c:show_circles=st.checkbox('Mostrar grandes círculos',True)
+ refdd=st.number_input('Dirección de buzamiento del plano de referencia (°)',0.,359.9,90.,key='refdd')
+ refdip=st.number_input('Buzamiento del plano de referencia (°)',0.,90.,90. if reference!='Techo de cámara' else 0.,key=f'refdip_{reference}')
+ entries=[dict(name=f'J{i+1}',dd=s['dd'],dip=s['dip'],color=COL[i]) for i,s in enumerate(systems)]
+ entries.append(dict(name='Referencia',dd=refdd,dip=refdip,color='#ffffff'))
+ chart=go.Figure();t=np.linspace(0,2*np.pi,360)
+ chart.add_trace(go.Scatter(x=np.sin(t),y=np.cos(t),mode='lines',line=dict(color='#7b90a7',width=2),showlegend=False,hoverinfo='skip'))
+ for rad in [.25,.5,.75]:chart.add_trace(go.Scatter(x=rad*np.sin(t),y=rad*np.cos(t),mode='lines',line=dict(color='#30445c',width=1),showlegend=False,hoverinfo='skip'))
+ for ang in range(0,180,30):
+  q=np.deg2rad(ang);chart.add_trace(go.Scatter(x=[-np.sin(q),np.sin(q)],y=[-np.cos(q),np.cos(q)],mode='lines',line=dict(color='#30445c',width=1),showlegend=False,hoverinfo='skip'))
+ for e in entries:
+  if show_circles:
+   gc=great_circle(e['dd'],e['dip'],projection)
+   chart.add_trace(go.Scatter(x=gc[:,0],y=gc[:,1],mode='lines',line=dict(color=e['color'],width=1,dash='dot'),opacity=.55,showlegend=False,hoverinfo='skip'))
+  x,y=pole(e['dd'],e['dip'],projection)
+  chart.add_trace(go.Scatter(x=[x],y=[y],mode='markers+text',text=[e['name']],textposition='top center',marker=dict(size=14,color=e['color'],line=dict(color='#0b1421',width=2)),name=e['name'],customdata=[[e['dd'],e['dip']]],hovertemplate=f"{e['name']}<br>Dir. buzamiento %{{customdata[0]}}°<br>Buzamiento %{{customdata[1]}}°<extra></extra>"))
+ chart.update_layout(height=590,margin=dict(l=10,r=10,t=10,b=10),paper_bgcolor='#0b1421',plot_bgcolor='#0b1421',font_color='#e1edf8',xaxis=dict(range=[-1.13,1.13],visible=False,scaleanchor='y',scaleratio=1),yaxis=dict(range=[-1.13,1.13],visible=False),legend=dict(orientation='h',y=-.02))
+ st.caption('Haz clic en dos polos para medir su separación angular. También puedes elegirlos en los desplegables.')
+ if 'picked' not in st.session_state:st.session_state.picked=[]
+ event=st.plotly_chart(chart,use_container_width=True,on_select='rerun',selection_mode='points',key='stereonet')
+ if event and event.selection and event.selection.points:
+  # El evento puede contener puntos de círculos; solo se aceptan las trazas de polos.
+  picked=[]
+  for pt in event.selection.points:
+   name=pt.get('legendgroup') or pt.get('name')
+   curve=pt.get('curve_number',pt.get('curveNumber',-1))
+   if isinstance(curve,int) and 0<=curve<len(chart.data):
+    trace=chart.data[curve]
+    if trace.name in [e['name'] for e in entries] and 'markers' in (trace.mode or ''):picked.append(trace.name)
+  if picked:st.session_state.picked=list(dict.fromkeys(picked))[-2:]
+ names=[e['name'] for e in entries]
+ c1,c2=st.columns(2)
+ with c1:p1=st.selectbox('Polo 1',names,index=names.index(st.session_state.picked[0]) if st.session_state.picked and st.session_state.picked[0] in names else len(names)-1)
+ with c2:p2=st.selectbox('Polo 2',names,index=names.index(st.session_state.picked[-1]) if len(st.session_state.picked)>1 and st.session_state.picked[-1] in names else 0)
+ e1=next(e for e in entries if e['name']==p1);e2=next(e for e in entries if e['name']==p2)
+ angle=angular(normal(e1['dd'],e1['dip']),normal(e2['dd'],e2['dip']))
+ st.metric(f'Separación angular entre {p1} y {p2}',f'{angle:.2f}°')
+ st.markdown('**Líneas de intersección entre familias (orientación geográfica)**')
+ intersections=[]
+ for i in range(len(systems)):
+  for j in range(i+1,len(systems)):
+   ori=intersection_orientation(systems[i],systems[j])
+   intersections.append({'Familias':f'J{i+1} × J{j+1}','Dirección (°)':round(ori[0],1) if ori else 'Indeterminada','Inmersión (°)':round(ori[1],1) if ori else 'Indeterminada'})
+ st.dataframe(pd.DataFrame(intersections),hide_index=True,use_container_width=True)
+ st.caption('Estas orientaciones por sí solas no determinan si existe una cuña cinemáticamente liberable.')
+ st.caption('Ángulo agudo entre los planos (equivalente a la separación mínima entre ejes de polos). No es una distancia en metros.')
+ rows=[{'Discontinuidad':e['name'],'Dir. buzamiento (°)':e['dd'],'Buzamiento (°)':e['dip'],'Ángulo con referencia (°)':round(angular(normal(refdd,refdip),normal(e['dd'],e['dip'])),2)} for e in entries[:-1]]
+ st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+ st.download_button('Descargar mediciones CSV',pd.DataFrame(rows).to_csv(index=False).encode('utf-8-sig'),'angulos_polos.csv','text/csv')
+ st.info('Para usar una curva de B de Potvin debe verificarse qué ángulo define exactamente esa curva. El ángulo entre polos y el ángulo polo–plano no son intercambiables.')
 
-
-
-def compare_spatial_components(block, blocks, original_labels, xs, ys, zs,
-                               systems, nplanes, W, H, L, az,
-                               resolutions=(48, 72, 96)):
-    """Compare reconstructed connected components to original voxel labels.
-
-    Nearest-neighbour resampling is a diagnostic, not geometric validation.
-    Returns overlap table and flags ambiguous many-to-one assignments.
-    """
-    from scipy import ndimage as ndi
-    result = connected_curved_components(block, systems, nplanes, W, H, L, az,
-                                         resolutions=resolutions)
-    if result.get('status') != 'ok':
-        return result
-    hs, _ = cell_halfspaces(systems, nplanes, W, H, L, az, block['center'])
-    poly = convex_polyhedron(hs)
-    low = poly['vertices'].min(axis=0)
-    high = poly['vertices'].max(axis=0)
-    step = float(np.max(high-low) / int(resolutions[-1]))
-    shape = np.maximum(3, np.ceil((high-low)/step).astype(int))
-    ax = [low[i]+(np.arange(shape[i])+.5)*step for i in range(3)]
-    xx, yy, zz = np.meshgrid(*ax, indexing='ij', sparse=True)
-    mask = np.ones(tuple(shape), dtype=bool)
-    for h in hs:
-        mask &= (h[0]*xx+h[1]*yy+h[2]*zz+h[3] <= 1e-9)
+# Cortes de resolución independiente del mallado voxel, usando planos analíticos.
+# El recorte de dominio y la clasificación siguen siendo preliminares.
+def slice_region(plane, position, block, nx=360, nz=300):
     r=W/2.; spring=max(0.,H-r)
-    mask &= ~((np.abs(xx)<=r) & ((zz<=spring) | (xx*xx+(zz-spring)**2<=r*r)))
-    components, n = ndi.label(mask, ndi.generate_binary_structure(3,1))
-    # Original voxel labels at the reconstructed cell centres. Out-of-domain = 0.
-    original_axes=[np.asarray(a) for a in (xs,ys,zs)]
-    indices=[]; valid=[]
-    for a,src in zip(ax,original_axes):
-        di=float(src[1]-src[0]); f=(a-src[0])/di
-        indices.append(np.clip(np.rint(f).astype(int),0,len(src)-1))
-        valid.append((f>=-.5)&(f<=len(src)-.5))
-    old=original_labels[np.ix_(*indices)].copy()
-    old[~(valid[0][:,None,None]&valid[1][None,:,None]&valid[2][None,None,:])]=0
-    old[~mask]=0
-    relevant=np.unique(old[old>0]); rows=[]
-    counts=np.bincount(components.ravel(),minlength=n+1)
-    for bid in relevant:
-        sub=(old==bid)
-        overlaps=np.bincount(components[sub],minlength=n+1)
-        overlaps[0]=0
-        cid=int(np.argmax(overlaps))
-        overlap=int(overlaps[cid])
-        original_count=int(sub.sum())
-        component_count=int(counts[cid]) if cid else 0
-        rows.append({'Bloque':f'B{bid}', 'Componente':cid,
-                     'Intersección (m³)':overlap*step**3,
-                     'Volumen original remuestreado (m³)':original_count*step**3,
-                     'Volumen componente (m³)':component_count*step**3,
-                     'Cobertura del bloque (%)':100*overlap/max(original_count,1),
-                     'Pureza de componente (%)':100*overlap/max(component_count,1),
-                     'Celdas coincidentes':overlap})
-    # Blocks outside the sampled cell are not compared; do not infer their absence.
-    mapping={row['Bloque']:row['Componente'] for row in rows if row['Componente']}
-    selected_key=f"B{block['id']}"
-    selected_row=next((row for row in rows if row['Bloque']==selected_key),None)
-    collisions=[key for key,cid in mapping.items()
-                if selected_row and cid==selected_row['Componente'] and key!=selected_key]
-    result.update({'overlap_table':rows,'selected_overlap':selected_row,
-                   'collisions':collisions,'compared_block_count':len(relevant),
-                   'mapping_validated':False})
-    return result
-
-
-
-def reconstruct_labeled_block(block, original_labels, xs, ys, zs, systems,
-                              nplanes, W, H, L, az, factors=(1, 2, 3)):
-    """Refine one ORIGINAL labeled region, preserving its voxel identity.
-
-    Original label is a topological prior; plane and curved excavation boundaries
-    are re-evaluated at finer sample centers. This is NOT an independent exact
-    polyhedron, and cannot resolve a missed or incorrectly split original region.
-    """
-    import numpy as np
-    from scipy import ndimage as ndi
-    bid = int(block['id'])
-    inds = np.argwhere(original_labels == bid)
-    if not len(inds):
-        return {'status':'missing_label'}
-    axes0 = [np.asarray(a,float) for a in (xs,ys,zs)]
-    steps0 = np.array([abs(a[1]-a[0]) for a in axes0])
-    lo = np.maximum(inds.min(axis=0)-1, 0)
-    hi = np.minimum(inds.max(axis=0)+1, np.array(original_labels.shape)-1)
-    # Only evaluate a padded neighborhood of the selected block.
-    # The original labels are the ownership mask; no other B can be included.
-    local = original_labels[lo[0]:hi[0]+1,lo[1]:hi[1]+1,lo[2]:hi[2]+1]
-    if local.size > 1200000:
-        return {'status':'too_large','detail':'Reduce el dominio o la resolución inicial'}
-    sample = np.asarray(block['center'],float)
-    hs,names = cell_halfspaces(systems,nplanes,W,H,L,az,sample)
-    progress=[]; last=None
-    for factor in factors:
-        factor=int(factor)
-        if factor<1 or factor>5: raise ValueError('Factor fuera de rango')
-        # Subdivide each original voxel into factor^3 cells, with the same physical extent.
-        orig_index=[np.repeat(np.arange(lo[d],hi[d]+1),factor) for d in range(3)]
-        fine_axes=[axes0[d][orig_index[d]] +
-                   ((np.tile(np.arange(factor),hi[d]-lo[d]+1)+.5)/factor-.5)*steps0[d]
-                   for d in range(3)]
-        x,y,z=np.meshgrid(*fine_axes,indexing='ij',sparse=True)
-        owned=(local==bid).repeat(factor,axis=0).repeat(factor,axis=1).repeat(factor,axis=2)
-        # Planar constraints use the same cell containing the selected block center.
-        for h in hs:
-            owned &= (h[0]*x+h[1]*y+h[2]*z+h[3] <= 1.e-9)
-        r=W/2.; spring=max(0.,H-r)
-        inside=(np.abs(x)<=r)&((z<=spring)|((x*x+(z-spring)**2)<=r*r))
-        owned &= ~inside
-        n=int(owned.sum())
-        vol=n*float(np.prod(steps0))/factor**3
-        cc,ncomp=ndi.label(owned,ndi.generate_binary_structure(3,1))
-        counts=np.bincount(cc.ravel(),minlength=ncomp+1)
-        if len(counts): counts[0]=0
-        largest=int(np.max(counts)) if ncomp else 0
-        progress.append({'Subdivisión por eje':factor,
-                         'Celdas de bloque':n,
-                         'Volumen individual estimado (m³)':float(vol),
-                         'Componentes internas':int(ncomp),
-                         'Fracción componente mayor (%)':float(100*largest/max(n,1))})
-        last={'mask':owned,'origin':np.array([a[0] for a in fine_axes]),
-              'spacing':steps0/factor,'components':int(ncomp)}
-    return {'status':'ok','block_id':bid,'progress':progress,
-            'individual_volume':progress[-1]['Volumen individual estimado (m³)'],
-            'original_volume':float(block['volume']),
-            'difference_pct':100*(progress[-1]['Volumen individual estimado (m³)']/block['volume']-1) if block['volume'] else None,
-            'mask':last['mask'],'origin':last['origin'],'spacing':last['spacing'],
-            'halfspace_names':names,
-            'validated':False,
-            'method':'Subdivisión de etiquetas originales y reevaluación de límites geométricos',
-            'warning':'Volumen experimental condicionado a la segmentación original; no equivale a reconstrucción exacta independiente.'}
-
-
-def diagnose_independent_block(block, blocks, original_labels, xs, ys, zs,
-                               systems, nplanes, W, H, L, az,
-                               resolutions=(36, 54, 72)):
-    """Independent plane-cell segmentation with spatial label correspondence.
-
-    The reconstructed geometry does not use original labels as constraints.
-    Original labels are sampled ONLY for comparison and visual diagnostics.
-    This is still a discretized, infinite-persistence, non-kinematic model.
-    """
-    import numpy as np
-    from scipy import ndimage as ndi
-    hs, names = cell_halfspaces(systems, nplanes, W, H, L, az, block['center'])
-    poly = convex_polyhedron(hs)
-    if poly.get('status') != 'ok':
-        return poly
-    low = np.asarray(poly['vertices']).min(axis=0)
-    high = np.asarray(poly['vertices']).max(axis=0)
-    span = high-low
-    if np.min(span) <= 1.e-10:
-        return {'status': 'degenerate_bounds'}
-    history=[]
-    final=None
-    source_axes=[np.asarray(a,float) for a in (xs,ys,zs)]
-    for resolution in resolutions:
-        step=float(np.max(span)/int(resolution))
-        shape=np.maximum(3,np.ceil(span/step).astype(int))
-        if int(np.prod(shape)) > 2500000:
-            return {'status':'too_large'}
-        axes=[low[d]+(np.arange(shape[d])+.5)*step for d in range(3)]
-        xx,yy,zz=np.meshgrid(*axes,indexing='ij',sparse=True)
-        mask=np.ones(tuple(shape),dtype=bool)
-        for h in hs:
-            mask &= h[0]*xx+h[1]*yy+h[2]*zz+h[3] <= 1.e-9
-        r=W/2.; spring=max(0.,H-r)
-        mask &= ~((np.abs(xx)<=r)&((zz<=spring)|(xx*xx+(zz-spring)**2<=r*r)))
-        cc,ncomp=ndi.label(mask,ndi.generate_binary_structure(3,1))
-        # Original labels are NOT used to construct the independent components.
-        idx=[]; valid=[]
-        for a,src in zip(axes,source_axes):
-            f=(a-src[0])/(src[1]-src[0])
-            idx.append(np.clip(np.rint(f).astype(int),0,len(src)-1))
-            valid.append((f>=-.5)&(f<=len(src)-.5))
-        original=original_labels[np.ix_(*idx)].copy()
-        in_domain=(valid[0][:,None,None]&valid[1][None,:,None]&valid[2][None,None,:])
-        original[~in_domain]=0
-        selected_original=(original==int(block['id']))
-        counts=np.bincount(cc.ravel(),minlength=ncomp+1)
-        overlaps=np.bincount(cc[selected_original],minlength=ncomp+1)
-        overlaps[0]=0
-        chosen=int(np.argmax(overlaps)) if ncomp else 0
-        matching=int(overlaps[chosen]) if chosen else 0
-        candidate=(cc==chosen)&mask if chosen else np.zeros_like(mask)
-        selected_inside=selected_original&mask
-        original_count=int(selected_original.sum())
-        candidate_count=int(counts[chosen]) if chosen else 0
-        coverage=100*matching/max(original_count,1)
-        purity=100*matching/max(candidate_count,1)
-        other_ids=np.unique(original[candidate])
-        collisions=[]
-        for bid in other_ids:
-            if bid<=0 or bid==block['id']:continue
-            ct=int(np.count_nonzero(candidate&(original==bid)))
-            if ct:collisions.append({'Bloque':f'B{int(bid)}','Solape (m³)':ct*step**3,
-                                     'Porcentaje componente (%)':100*ct/max(candidate_count,1)})
-        history.append({'Resolución':int(resolution),'Componentes':int(ncomp),
-                        'Volumen candidato (m³)':candidate_count*step**3,
-                        'Volumen B original remuestreado (m³)':original_count*step**3,
-                        'Cobertura B (%)':coverage,'Pureza componente (%)':purity,
-                        'Otros bloques en componente':len(collisions)})
-        final={'candidate_mask':candidate,'original_mask':selected_original,
-               'original_inside_mask':selected_inside,'origin':low.copy(),'step':step,
-               'collisions':collisions,'component_id':chosen,
-               'component_count':ncomp,'matching_cells':matching,
-               'coverage_pct':coverage,'purity_pct':purity,
-               'candidate_volume':candidate_count*step**3,
-               'original_resampled_volume':original_count*step**3}
-    vols=[row['Volumen candidato (m³)'] for row in history]
-    convergence=100*abs(vols[-1]-vols[-2])/max(vols[-1],1.e-12) if len(vols)>1 else None
-    ambiguous=bool(final['collisions']) or final['purity_pct']<90 or final['coverage_pct']<90
-    return {'status':'ok','progress':history,'convergence_pct':convergence,
-            'ambiguous':ambiguous,'halfspace_names':names,**final,
-            'validated':False,'method':'Segmentación espacial sin etiquetas; comparación posterior con etiquetas originales'}
-
-"""Motor v18: diagnóstico reproducible de celdas y conectividad.
-No calcula cuñas cinemáticamente liberables ni factores de seguridad.
-"""
-import numpy as np
-from scipy import ndimage as ndi
-from scipy.spatial import ConvexHull
-from scipy.optimize import linprog
-
-
-def normal(dd, dip, az=0):
-    a,b=np.deg2rad([(dd-az)%360,dip])
-    return np.array([np.sin(a)*np.sin(b),np.cos(a)*np.sin(b),np.cos(b)])
-
-
-def planes(systems, nplanes, H, az):
-    out=[]
-    for j,s in enumerate(systems,1):
-        n=normal(s['dd'],s['dip'],az)
-        base=n@np.array([s['xx'],s['yy'],H])
-        for k in range(nplanes):
-            level=base+(k-(nplanes-1)/2)*s['spacing']
-            out.append((f'J{j}.{k+1}',n,float(level)))
-    return out
-
-
-def signature_at(p, plane_list):
-    return tuple(int(np.dot(n,p)>=d) for _,n,d in plane_list)
-
-
-def rock_mask(X,Z,W,H):
-    r=W/2; spring=max(0,H-r)
-    void=(np.abs(X)<=r)&((Z<=spring)|((Z>spring)&(X*X+(Z-spring)**2<=r*r)))
-    return ~void
-
-
-def grid_diagnostic(block, labels, xs, ys, zs, systems, nplanes, W, H, L, az, resolution=80):
-    """Auditoría por propiedad exclusiva de la etiqueta original.
-
-    No atribuye a B el volumen de una componente reconstruida que contenga
-    otros bloques. La reconstrucción independiente se conserva solo como
-    comprobación de discrepancias, no como geometría ni volumen de B.
-    """
-    ident = int(block['id'])
-    idx = np.argwhere(labels == ident)
-    if not len(idx):
-        return {'status': 'missing'}
-    pl = planes(systems, nplanes, H, az)
-    original_sig = int(block.get('signature', -1))
-    # Verificación exhaustiva: no basta con 60 puntos o con el centroide.
-    for bit, (_, n, d) in enumerate(pl):
-        coords = np.column_stack((xs[idx[:, 0]], ys[idx[:, 1]], zs[idx[:, 2]]))
-        actual = (coords @ n >= d)
-        if np.any(actual != bool(original_sig & (1 << bit))):
-            return {'status': 'inconsistent_original_signatures', 'plane': bit + 1}
-    step0 = np.array([xs[1]-xs[0], ys[1]-ys[0], zs[1]-zs[0]], float)
-    margin = np.maximum(3*step0, 0.75)
-    low = np.maximum([xs[0], ys[0], zs[0]],
-                     np.array([xs[idx[:,0].min()], ys[idx[:,1].min()], zs[idx[:,2].min()]])-margin)
-    high = np.minimum([xs[-1], ys[-1], zs[-1]],
-                      np.array([xs[idx[:,0].max()], ys[idx[:,1].max()], zs[idx[:,2].max()]])+margin)
-    step = float(max(high-low)/int(resolution))
-    dims = np.maximum(3, np.ceil((high-low)/step).astype(int))
-    if int(np.prod(dims)) > 3000000:
-        return {'status': 'too_large'}
-    ax = [low[i]+(np.arange(dims[i])+.5)*step for i in range(3)]
-    X,Y,Z = np.meshgrid(*ax,indexing='ij',sparse=True)
-    reconstructed = np.broadcast_to(rock_mask(X,Z,W,H),tuple(dims)).copy()
-    for bit,(_,n,d) in enumerate(pl):
-        signed = n[0]*X+n[1]*Y+n[2]*Z-d
-        reconstructed &= signed >= 0 if (original_sig & (1 << bit)) else signed < 0
-    # Propietario de cada punto según la única segmentación de referencia.
-    ix = np.rint((ax[0]-xs[0])/step0[0]).astype(int)
-    iy = np.rint((ax[1]-ys[0])/step0[1]).astype(int)
-    iz = np.rint((ax[2]-zs[0])/step0[2]).astype(int)
-    valid = ((ix[:,None,None]>=0)&(ix[:,None,None]<len(xs)) &
-             (iy[None,:,None]>=0)&(iy[None,:,None]<len(ys)) &
-             (iz[None,None,:]>=0)&(iz[None,None,:]<len(zs)))
-    owner = labels[np.ix_(np.clip(ix,0,len(xs)-1),np.clip(iy,0,len(ys)-1),np.clip(iz,0,len(zs)-1))].copy()
-    owner[~valid]=0
-    original_mask = owner==ident
-    owned = reconstructed & original_mask
-    structure = ndi.generate_binary_structure(3,1)
-    components,ncomp = ndi.label(owned,structure=structure)
-    records=[]
-    for c in range(1,ncomp+1):
-        cm=components==c
-        if not cm.any(): continue
-        records.append({'component':c,'volume_m3':float(cm.sum()*step**3),
-                        'overlap_selected_m3':float(cm.sum()*step**3),
-                        'purity_pct':100.,'other_blocks':'','mask':cm})
-    records.sort(key=lambda x:-x['volume_m3'])
-    if not records:return {'status':'no_components'}
-    chosen=records[0]
-    # La cobertura evalúa la pérdida por recorte de planos y herradura.
-    coverage=100*owned.sum()/max(1,original_mask.sum())
-    # Fracción de la componente independiente que pertenece a B (diagnóstico).
-    independent,ni=ndi.label(reconstructed,structure=structure)
-    overlap=np.bincount(independent[owned],minlength=ni+1)
-    overlap[0]=0
-    cid=int(np.argmax(overlap)) if ni else 0
-    candidate=independent==cid if cid else np.zeros_like(owned)
-    foreign_ids=np.unique(owner[candidate & (owner>0) & (owner!=ident)])
-    foreign=[f'B{int(x)}' for x in foreign_ids]
-    purity=100*float((candidate & owned).sum())/max(1,int(candidate.sum()))
-    touches=bool(any(np.any(v) for v in (owned[0],owned[-1],owned[:,0],owned[:,-1],owned[:,:,0],owned[:,:,-1])))
-    return {'status':'ok','signature':original_sig,'planes':pl,
-            'component_count':len(records),'components':records,'chosen':chosen,
-            'coverage_pct':coverage,'iou_pct':100*owned.sum()/max(1,(original_mask|owned).sum()),
-            'original_resampled_m3':float(original_mask.sum()*step**3),
-            'owned_volume_m3':float(owned.sum()*step**3),
-            'selected_voxel_m3':float(block['volume']),
-            'origin':low,'step':step,'grid':tuple(dims),
-            'original_mask':original_mask,'intersection_mask':owned,
-            'owned_mask':owned,'independent_mask':candidate,
-            'foreign_blocks':foreign,'independent_purity_pct':purity,
-            'window_touches':touches,
-            'note':'Volumen de submuestreo condicionado a etiqueta original, no volumen exacto independiente.'}
-
-
-def synthetic_tests():
-    """Simple numerical invariants independent of the application scenario."""
-    n=normal(0,90,0)
-    assert np.allclose(n,[0,1,0],atol=1e-12)
-    a=np.array([-.5,.5]);z=np.array([1.,4.])
-    assert not rock_mask(a[0],z[0],5.8,5.8)
-    assert rock_mask(4.,3.,5.8,5.8)
-    assert rock_mask(0.,6.,5.8,5.8)
-    return True
-
-def compute_regions(W, H, L, az, res, nplanes, systems_json):
-    """Motor único: celdas de semiespacios + componentes conexas 6-vecinos.
-
-    Los IDs B son locales a la resolución. Los volúmenes se estiman mediante
-    integración subvoxel 2x2x2 condicionada a la firma de cada celda. La
-    persistencia es infinita; no hay liberación cinemática ni FS.
-    """
-    systems = json.loads(systems_json)
-    r = W / 2.0
-    spring = max(0.0, H-r)
-    margin = max(2.0, W*0.5)
-    nx = int(res)
-    ny = max(30, min(105, round(res*L/(W+2*margin))))
-    nz = max(35, min(85, round(res*(H+margin)/(W+2*margin))))
-    xs = np.linspace(-r-margin, r+margin, nx)
-    ys = np.linspace(0, L, ny)
-    zs = np.linspace(0, H+margin, nz)
-    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij', sparse=True)
-    planes_list = planes(systems, nplanes, H, az)
-    if len(planes_list) > 30:
-        raise ValueError('Se admiten como máximo 30 planos en el motor de firmas')
-    signature = np.zeros((nx, ny, nz), dtype=np.uint32)
-    for bit, (_, n, d) in enumerate(planes_list):
-        signature |= ((n[0]*X+n[1]*Y+n[2]*Z >= d).astype(np.uint32) << bit)
-    rock = np.broadcast_to(rock_mask(X, Z, W, H), signature.shape).copy()
-    structure = ndi.generate_binary_structure(3, 1)
-    tunnel = ~rock
-    adjacent = rock & ndi.binary_dilation(tunnel, structure=structure)
-    labels = np.zeros(signature.shape, dtype=np.int16)
-    blocks = []
-    dx, dy, dz = (float(a[1]-a[0]) for a in (xs, ys, zs))
-    cell_volume = dx*dy*dz
-    ident = 0
-    # Cada firma define una celda de discontinuidades. La conectividad se
-    # comprueba DENTRO de esa firma, nunca mediante proximidad de centroides.
-    for sig in np.unique(signature[adjacent]):
-        component_labels, _ = ndi.label(rock & (signature == sig), structure)
-        for component in np.unique(component_labels[adjacent]):
-            if component == 0:
-                continue
-            reg = component_labels == component
-            count = int(reg.sum())
-            if count < 5:
-                continue
-            touching = reg & adjacent
-            roof = int((touching & (Z > spring)).sum())
-            left = int((touching & (Z <= spring) & (X < 0)).sum())
-            right = int((touching & (Z <= spring) & (X >= 0)).sum())
-            zone = ['Bóveda', 'Hastial izq.', 'Hastial der.'][int(np.argmax([roof,left,right]))]
-            opened = bool(reg[0].any() or reg[-1].any() or reg[:,0].any()
-                          or reg[:,-1].any() or reg[:,:,0].any() or reg[:,:,-1].any())
-            ident += 1
-            if ident > np.iinfo(labels.dtype).max:
-                raise ValueError('Demasiadas regiones para etiquetas int16')
-            labels[reg] = ident
-            coords = np.argwhere(reg)
-            cc = np.argwhere(touching)
-            center = [float(xs[0]+coords[:,0].mean()*dx),
-                      float(ys[0]+coords[:,1].mean()*dy),
-                      float(zs[0]+coords[:,2].mean()*dz)]
-            contact = [float(xs[0]+cc[:,0].mean()*dx),
-                       float(ys[0]+cc[:,1].mean()*dy),
-                       float(zs[0]+cc[:,2].mean()*dz)]
-            # Submuestreo de la celda de planos en los 8 octantes de cada
-            # voxel asignado; la malla de etiquetas NO se altera.
-            # Se procesa por lotes para limitar memoria.
-            weighted = 0.0
-            for batch_start in range(0, len(coords), 120000):
-                c = coords[batch_start:batch_start+120000]
-                x0, y0, z0 = xs[c[:,0]], ys[c[:,1]], zs[c[:,2]]
-                for sx in (-0.25, 0.25):
-                    for sy in (-0.25, 0.25):
-                        for sz in (-0.25, 0.25):
-                            x, y, z = x0+sx*dx, y0+sy*dy, z0+sz*dz
-                            keep = rock_mask(x, z, W, H)
-                            for bit, (_, n, d) in enumerate(planes_list):
-                                expected = bool(int(sig) & (1 << bit))
-                                if expected:
-                                    keep &= (n[0]*x+n[1]*y+n[2]*z >= d)
-                                else:
-                                    keep &= (n[0]*x+n[1]*y+n[2]*z < d)
-                            weighted += int(np.count_nonzero(keep))/8.0
-            estimated = weighted*cell_volume
-            blocks.append(dict(id=ident, zone=zone, volume=estimated,
-                               voxel_volume=count*cell_volume,
-                               open=opened, center=center, contact=contact,
-                               signature=int(sig), method='subvoxel_2x2x2',
-                               sample_count=count))
-    return xs, ys, zs, labels, blocks
-
-
-def test_region_invariants():
-    """Pruebas deterministas de exclusividad, conectividad y firmas."""
-    import json as _json
-    fam = [dict(dd=d, dip=60., xx=0., yy=y, spacing=2., persistence=5., phi=30.)
-           for d, y in ((30., 6.), (150., 7.), (270., 8.))]
-    xs, ys, zs, labels, blocks = compute_regions(5.8,5.8,15.,0.,36,2,_json.dumps(fam))
-    assert len(blocks) > 0
-    assert len({b['id'] for b in blocks}) == len(blocks)
-    assert np.all(labels >= 0)
-    structure = ndi.generate_binary_structure(3, 1)
-    pl = planes(fam,2,5.8,0.)
-    for b in blocks:
-        mask = labels == b['id']
-        assert mask.any()
-        assert ndi.label(mask,structure)[1] == 1
-        assert 0 <= b['volume'] <= b['voxel_volume'] + 1e-8
-        assert b['signature'] == sum(bit << i for i, bit in enumerate(signature_at(np.array(b['center']),pl)))
-    return {'blocks':len(blocks), 'connected':True, 'exclusive':True}
-
-
-
-def _sample_grid_labels(points, axes, labels):
-    """Nearest voxel-center lookup; outside-grid points remain unassigned."""
-    indices = []
-    valid = np.ones(len(points), dtype=bool)
-    for k, axis in enumerate(axes):
-        step = float(axis[1] - axis[0])
-        v = (points[:, k] - axis[0]) / step
-        valid &= (v >= -0.5) & (v <= len(axis) - 0.5)
-        indices.append(np.clip(np.rint(v).astype(int), 0, len(axis) - 1))
-    out = np.zeros(len(points), dtype=np.int32)
-    out[valid] = labels[indices[0][valid], indices[1][valid], indices[2][valid]]
-    return out
-
-
-def _block_points(axes, labels, block_id, limit=25000):
-    idx = np.argwhere(labels == int(block_id))
-    if len(idx) > limit:
-        idx = idx[np.linspace(0, len(idx)-1, limit, dtype=int)]
-    return np.column_stack([axes[k][idx[:, k]] for k in range(3)]) if len(idx) else np.empty((0, 3))
-
-
-def _match_block(source_block, source_axes, source_labels, target_axes,
-                 target_labels, target_blocks, coverage_min=0.90,
-                 purity_min=0.90, dominance_min=0.90):
-    """Signature-aware, reciprocal and one-to-one spatial correspondence.
-
-    A target is never accepted based solely on maximal overlap. The reverse
-    association must identify the source block as its dominant source label.
-    """
-    source_id = int(source_block['id'])
-    src = _block_points(source_axes, source_labels, source_id)
-    result = dict(status='Sin correspondencia válida', block_id=None,
-                  volume=None, coverage=0., purity=None, others=0,
-                  reason='No se encontró una región compatible')
-    if not len(src):
-        return result
-    mapped = _sample_grid_labels(src, target_axes, target_labels)
-    candidates = {int(b['id']): b for b in target_blocks
-                  if b.get('signature') == source_block.get('signature')}
-    compatible = [(bid, int(np.count_nonzero(mapped == bid)))
-                  for bid in candidates]
-    compatible = sorted(((bid, n) for bid, n in compatible if n),
-                        key=lambda item: -item[1])
-    if not compatible:
-        result['reason'] = 'No hay componentes con la misma firma de planos'
-        return result
-    bid, nmatch = compatible[0]
-    coverage = nmatch / len(src)
-    result['coverage'] = 100 * coverage
-    result['others'] = sum(1 for other_id, count in compatible[1:]
-                           if count >= max(2, int(.01 * len(src))))
-    candidate_pts = _block_points(target_axes, target_labels, bid)
-    back = _sample_grid_labels(candidate_pts, source_axes, source_labels)
-    purity = float(np.mean(back == source_id)) if len(back) else 0.
-    result['purity'] = 100 * purity
-    counts = np.bincount(back, minlength=max(source_id + 1, 1))
-    dominant = int(np.argmax(counts[1:]) + 1) if len(counts) > 1 and counts[1:].max() else 0
-    dominant_share = (counts[dominant] / len(back)) if len(back) else 0.
-    if coverage < coverage_min:
-        result['reason'] = 'Cobertura espacial insuficiente'
-    elif purity < purity_min:
-        result['reason'] = 'La región candidata contiene mayoritariamente otros volúmenes'
-    elif dominant != source_id or dominant_share < dominance_min:
-        result['reason'] = 'Correspondencia inversa no exclusiva'
-    elif result['others']:
-        result['reason'] = 'La región original se divide en varias componentes'
+    if plane=='transversal':
+        h=np.linspace(-r-2.0,r+2.0,nx)
     else:
-        result.update(status='Correspondencia provisional', block_id=bid,
-                      volume=float(candidates[bid]['volume']),
-                      reason='Firma y correspondencia recíproca compatibles')
-    return result
+        h=np.linspace(0,L,nx)
+    z=np.linspace(-.35,H+3.,nz)
+    U,Z=np.meshgrid(h,z)
+    if plane=='transversal': X=U;Y=np.full_like(U,position)
+    else: X=np.full_like(U,position);Y=U
+    center=np.asarray(block['center'])
+    # Campo negativo dentro de la celda definida por las mismas caras de discontinuidad.
+    field=np.full_like(U,-1.e6,dtype=float)
+    for fam in systems:
+        n=normal((fam['dd']-az)%360,fam['dip'])
+        base=np.dot(n,[fam['xx'],fam['yy'],H])
+        for k in range(nplanes):
+            offset=(k-(nplanes-1)/2)*fam['spacing']
+            signed=n[0]*X+n[1]*Y+n[2]*Z-base-offset
+            side=1. if (np.dot(n,center)-base-offset)>=0 else -1.
+            field=np.maximum(field,-side*signed)
+    # Roca exterior a la excavación; sección en herradura con piso excluido.
+    outside=np.where(Z<=spring,np.abs(X)-r,np.sqrt(X*X+(Z-spring)**2)-r)
+    field=np.maximum(field,-outside)
+    # Dominio finito: no es una superficie geológica de cierre.
+    for coord,lo,hi in ((X,xs[0],xs[-1]),(Y,ys[0],ys[-1]),(Z,zs[0],zs[-1])):
+        field=np.maximum(field,lo-coord)
+        field=np.maximum(field,coord-hi)
+    return h,z,field
+
+def make_slice(plane,position,block):
+    h,z,field=slice_region(plane,position,block)
+    fig=go.Figure()
+    # Extraer isolíneas continuas, en lugar de dibujar cuadrados del mallado.
+    contours=find_contours(field,0.0)
+    for poly in contours:
+        if len(poly)<5:continue
+        xx=np.interp(poly[:,1],np.arange(len(h)),h)
+        zz=np.interp(poly[:,0],np.arange(len(z)),z)
+        fig.add_trace(go.Scatter(x=xx,y=zz,mode='lines',fill='toself',
+            fillcolor='rgba(30,190,145,.55)',line=dict(color='#00c998',width=2.6),
+            name='Región analítica',hovertemplate='%{x:.2f} m / %{y:.2f} m<extra></extra>'))
+    r=W/2.;spring=max(0.,H-r)
+    if plane=='transversal':
+        fig.add_trace(go.Scatter(x=section[:,0],y=section[:,1],mode='lines',
+            line=dict(color='#2563eb',width=5),name='Contorno de excavación'))
+        fig.add_trace(go.Scatter(x=[-r,r],y=[0,0],mode='lines',
+            line=dict(color='#64748b',width=2,dash='dash'),name='Solera (sin sostenimiento)'))
+        xr=[-r-2,r+2];xlabel='Transversal X (m)'
+    else:
+        roof=spring+np.sqrt(max(0,r*r-position*position)) if abs(position)<=r else None
+        if roof is not None:
+            fig.add_trace(go.Scatter(x=[0,L,L,0,0],y=[0,0,roof,roof,0],
+                mode='lines',fill='toself',fillcolor='rgba(59,130,246,.09)',
+                line=dict(color='#2563eb',width=3),name='Excavación longitudinal'))
+        xr=[0,L];xlabel='Longitudinal Y (m)'
+    fig.update_layout(height=530,margin=dict(l=60,r=20,t=55,b=55),
+        title=('Transversal Y' if plane=='transversal' else 'Longitudinal X')+f' = {position:.2f} m',
+        paper_bgcolor='#ffffff',plot_bgcolor='#f8fafc',font=dict(color='#172b45',size=13),
+        xaxis=dict(title=xlabel,range=xr,showgrid=True,gridcolor='#dce5ee',zeroline=False),
+        yaxis=dict(title='Altura Z (m)',range=[-.5,H+3.2],showgrid=True,gridcolor='#dce5ee',
+                   scaleanchor='x',scaleratio=1,zeroline=False),
+        legend=dict(orientation='h',y=-.19),hovermode='closest')
+    return fig
+
+with tabs[2]:
+ st.subheader('Cortes 2D · contornos continuos y excavación completa')
+ st.caption('Secciones de los planos analíticos que delimitan la región seleccionada. No son una comprobación de liberación cinemática ni de persistencia de juntas.')
+ cuty=st.slider('Posición del corte transversal Y (m)',0.,float(L),float(np.clip(selected['contact'][1],0,L)),.1)
+ cutx=st.slider('Posición del corte longitudinal X (m)',float(-W/2),float(W/2),float(np.clip(selected['contact'][0],-W/2,W/2)),.1)
+ ca,cb=st.columns(2)
+ with ca:st.plotly_chart(make_slice('transversal',cuty,selected),use_container_width=True)
+ with cb:st.plotly_chart(make_slice('longitudinal',cutx,selected),use_container_width=True)
+ st.info('Los contornos son continuos e independientes de la resolución voxel. Las caras son prolongaciones de planos sin recorte por persistencia; una región cerrada en el dominio no demuestra que sea una cuña desprendible.')
+
+with tabs[3]:
+ st.subheader('Sostenimiento seleccionado')
+ st.write(f'**{typ}** · Pernos {boltlen:.1f} m · patrón aproximado {boltspace:.1f} × {boltspace:.1f} m · gunita {shot*100:.0f} cm · cables {cablelen:.1f} m · malla {"sí" if mesh else "no"}')
+ st.write('**Comparador preliminar de escenarios**')
+ variants=pd.DataFrame([{'Alternativa':'Sin sostenimiento','Pernos':'No','Gunita (cm)':0,'Cables (m)':0},{'Alternativa':'Solo pernos','Pernos':f'{boltlen:.1f} m','Gunita (cm)':0,'Cables (m)':0},{'Alternativa':'Solo gunita','Pernos':'No','Gunita (cm)':round(shot*100,1),'Cables (m)':0},{'Alternativa':'Combinado','Pernos':f'{boltlen:.1f} m','Gunita (cm)':round(shot*100,1),'Cables (m)':cablelen}]);st.dataframe(variants,hide_index=True,use_container_width=True)
+ st.warning('No se asigna resistencia ni FS a estas alternativas. Para hacerlo hacen falta mecanismos cinemáticos, áreas de contacto, propiedades resistentes, cargas y un modelo verificado de transferencia de esfuerzos.')
+ st.markdown('**Interpretación de intersecciones:** un perno que atraviesa un bloque no necesariamente lo estabiliza; hay que verificar orientación, longitud anclada fuera del bloque, adherencia y capacidad.')
+
+with tabs[4]:
+ st.subheader('Cámaras mineras · análisis de orientación para Mathews–Potvin')
+ st.write('La tabla del estereograma proporciona el ángulo entre el plano de cada discontinuidad y el muro o techo de referencia.')
+ st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+ q=st.number_input('Q′ (índice modificado, introducido por el usuario)',.01,1000.,2.,.1)
+ A=st.number_input('Factor A (introducido por el usuario)',0.,5.,1.,.05)
+ B=st.number_input('Factor B (obtenido de curva Potvin, introducido por el usuario)',0.,5.,.5,.05)
+ C=st.number_input('Factor C (introducido por el usuario)',0.,20.,2.,.1)
+ st.metric('Número de estabilidad modificado N′',f'{q*A*B*C:.3f}')
+ st.info('N′=Q′×A×B×C. Esta versión NO infiere automáticamente B de los ángulos: requiere seleccionar y digitalizar una curva bibliográfica identificada y verificar su definición angular. Tampoco evalúa el radio hidráulico ni traza límites de estabilidad.')
+
+with tabs[5]:
+ st.subheader('Sensibilidad geométrica · escenarios ilustrativos')
+ st.caption('Variación del volumen y del peso por escala de visualización. NO es un análisis de factor de seguridad ni cambia las discontinuidades reales.')
+ multipliers=np.arange(.5,1.51,.1)
+ df_sens=pd.DataFrame({'Escala visual':np.round(multipliers,2),'Volumen visual (m³)':selected['volume']*multipliers**3,'Peso visual (kN)':selected['volume']*gamma*multipliers**3})
+ st.line_chart(df_sens.set_index('Escala visual')[['Volumen visual (m³)']],height=300)
+ st.dataframe(df_sens.round(3),hide_index=True,use_container_width=True)
+ st.download_button('Descargar sensibilidad CSV',df_sens.to_csv(index=False).encode('utf-8-sig'),'sensibilidad_geometrica_v162.csv','text/csv')
+ st.info('No se reproduce el FS simplificado de GeologgIA: la estabilidad requiere comprobar cinemática, fuerzas y sostenimiento efectivo.')
+
+with tabs[6]:
+ data={'version':'25.0 motor único (geometría preliminar)','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
+ st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v25.json','application/json')
+ st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v25.csv','text/csv')
+ st.caption('Exportaciones de datos geométricos preliminares. No constituyen informe de diseño.')
 
 
-def compare_block_resolution(block, xs, ys, zs, labels, W, H, L, az,
-                             nplanes, systems_json, resolutions=(48, 72)):
-    """Auditoría conservadora: firma, correspondencia mutua y comparación directa.
-
-    Los identificadores B no son persistentes entre mallas. Si un candidato
-    no supera los controles, su volumen NO entra en la comparación.
-    """
-    base_axes = (xs, ys, zs)
-    history, snapshots = [], []
-    for resolution in resolutions:
-        ax, ay, zz, newlabels, newblocks = compute_regions(
-            W, H, L, az, int(resolution), nplanes, systems_json)
-        axes = (ax, ay, zz)
-        matched = _match_block(block, base_axes, labels, axes, newlabels, newblocks)
-        history.append({
-            'Resolución': int(resolution),
-            'Correspondencia': matched['status'],
-            'Bloque equivalente': ('B' + str(matched['block_id'])) if matched['block_id'] else 'Sin correspondencia válida',
-            'Volumen comparable (m³)': matched['volume'],
-            'Cobertura (%)': matched['coverage'],
-            'Pureza inversa (%)': matched['purity'],
-            'Otros bloques coincidentes': matched['others'],
-            'Motivo': matched['reason']})
-        snapshots.append((axes, newlabels, newblocks, matched))
-
-    direct = None
-    if len(snapshots) == 2 and all(s[3]['block_id'] is not None for s in snapshots):
-        a, b = snapshots
-        ba = next(item for item in a[2] if item['id'] == a[3]['block_id'])
-        ab = _match_block(ba, a[0], a[1], b[0], b[1], b[2])
-        bb = next(item for item in b[2] if item['id'] == b[3]['block_id'])
-        reverse = _match_block(bb, b[0], b[1], a[0], a[1], a[2])
-        direct = (ab['block_id'] == bb['id'] and
-                  reverse['block_id'] == ba['id'] and
-                  ab['status'] == 'Correspondencia provisional' and
-                  reverse['status'] == 'Correspondencia provisional')
-    comparable = len(history) == 2 and all(r['Volumen comparable (m³)'] is not None for r in history) and direct is True
-    delta = (100 * abs(history[1]['Volumen comparable (m³)'] - history[0]['Volumen comparable (m³)']) /
-             max(history[1]['Volumen comparable (m³)'], 1e-12)) if comparable else None
-    if not comparable:
-        # Do not display even provisional volumes when the direct comparison fails.
-        for row in history:
-            row['Volumen comparable (m³)'] = None
-            if row['Correspondencia'] == 'Correspondencia provisional':
-                row['Correspondencia'] = 'Sin correspondencia válida'
-                row['Motivo'] = 'No se confirma la correspondencia directa 48 ↔ 72'
-    return {'status': 'ok', 'history': history, 'volume_change_pct': delta,
-            'ambiguous': not comparable, 'direct_match': direct,
-            'validated': False}
+with tabs[7]:
+ st.header('⚙️ Motor geotécnico unificado · Geotecnia Mina v25')
+ st.caption('Un único motor de cálculo para detección de regiones, volúmenes preliminares, diagnóstico y exportación. Las comprobaciones no sustituyen el volumen de referencia.')
+ st.warning('GEOMETRÍA PRELIMINAR: la conectividad se calcula por firmas de planos; el volumen se estima por submuestreo 2×2×2 de cada voxel. Las etiquetas y superficies 3D siguen discretizadas. Sin persistencia finita, liberación cinemática ni FS. No usar para dimensionamiento.')
+ st.caption(f"Firma de discontinuidades de B{selected['id']}: {selected.get('signature', '—')} · Volumen voxel bruto: {selected.get('voxel_volume', selected['volume']):.4f} m³")
+ st.subheader(f"Región seleccionada: B{selected['id']} · {selected['zone']}")
+ a,b,c,d=st.columns(4)
+ a.metric('Volumen estimado (subvoxel)',f"{selected['volume']:.4f} m³")
+ b.metric('Peso estimado',f"{selected['volume']*gamma:.2f} kN")
+ c.metric('Condición de dominio','Abierta' if selected['open'] else 'Cerrada')
+ d.metric('FS validado','No calculado')
+ st.info('La condición abierta/cerrada se refiere únicamente a los límites del dominio discretizado; no demuestra desprendimiento.')
+ st.subheader('Comprobación de identidad y conectividad')
+ r20=st.select_slider('Resolución del diagnóstico',options=[40,60,80,100],value=60,key='unico_res')
+ if st.button('Comprobar geometría del bloque seleccionado',key='unico_go'):
+  with st.spinner('Comprobando conectividad y solapamiento con el bloque de referencia...'):
+   try:
+    check=grid_diagnostic(selected,labels,xs,ys,zs,systems,nplanes,W,H,L,az,resolution=r20)
+   except Exception as exc:
+    st.error(f'No se completó la comprobación: {type(exc).__name__}: {exc}')
+    check={'status':'error'}
+  if check['status']!='ok':
+   st.error('Comprobación no disponible: '+str(check['status']))
+  else:
+   chosen=check['chosen']
+   c1,c2,c3,c4=st.columns(4)
+   c1.metric('Componentes de B en ventana',check['component_count'])
+   c2.metric('Cobertura del bloque',f"{check['coverage_pct']:.1f} %")
+   c3.metric('Volumen B en ventana',f"{check['owned_volume_m3']:.4f} m³")
+   c4.metric('Pureza B en componente independiente',f"{check['independent_purity_pct']:.1f} %")
+   st.dataframe(pd.DataFrame([{k:v for k,v in item.items() if k!='mask'} for item in check['components']]).round(4),hide_index=True,use_container_width=True)
+   if check['window_touches']:
+    st.warning('La porción de B alcanza el borde de la ventana: el volumen local puede ser parcial.')
+   if check['foreign_blocks']:
+    st.warning('La reconstrucción independiente agrupa otras etiquetas: '+', '.join(check['foreign_blocks'])+'. NO se incorporan a B. Esto señala una discrepancia de conectividad entre resoluciones, no un solapamiento físico de volúmenes asignados.')
+   if check['component_count']>1:
+    st.warning('La región de referencia se divide en varias componentes al remuestrear. Comprobar la sensibilidad a la resolución.')
+   if check['coverage_pct']<90:
+    st.warning('Parte de la etiqueta original queda fuera de los límites geométricos evaluados. Identidad sin validar.')
+   st.caption('La auditoría respeta la propiedad exclusiva de cada etiqueta. Su volumen local no sustituye el volumen principal; la pureza independiente es solo una comparación entre métodos.')
+   st.subheader('Superposición de comprobación 3D')
+   figcheck=go.Figure()
+   for maskcheck,colcheck,titlecheck,opcheck in [(check['original_mask'],'#f7b955','Etiqueta de referencia',.45),(check['owned_mask'],'#34d6aa','Parte de B que cumple los planos',.75)]:
+    if maskcheck.sum()>3:
+     vv,ff,_,_=marching_cubes(np.pad(maskcheck.astype(np.float32),1),.5,spacing=(check['step'],)*3)
+     vv+=check['origin']-.5*check['step']
+     figcheck.add_trace(go.Mesh3d(x=vv[:,0],y=vv[:,1],z=vv[:,2],i=ff[:,0],j=ff[:,1],k=ff[:,2],color=colcheck,opacity=opcheck,name=titlecheck,flatshading=True))
+   figcheck.update_layout(height=560,paper_bgcolor='#0b1421',font_color='white',margin=dict(l=0,r=0,t=20,b=0),scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white'),yaxis=dict(title='Y (m)',color='white'),zaxis=dict(title='Z (m)',color='white')))
+   st.plotly_chart(figcheck,use_container_width=True)
+   st.caption('Visualización voxelizada: comparación de la misma etiqueta, sin fusionarla con B15/B16 u otras regiones.')
+ st.divider()
+ st.subheader('Auditoría de resolución e identidad del bloque')
+ st.caption('Solo compara regiones con la misma firma de discontinuidades, cobertura y pureza suficientes y correspondencia recíproca entre mallas. Si falla, no se asigna volumen.')
+ if st.button('Comparar resoluciones 48 y 72',key='v21_resolution_go'):
+  with st.spinner('Calculando las regiones y sus correspondencias en dos resoluciones...'):
+   try:
+    audit=compare_block_resolution(selected,xs,ys,zs,labels,W,H,L,az,nplanes,json.dumps(systems,sort_keys=True))
+    if audit['status']=='ok':
+     st.dataframe(pd.DataFrame(audit['history']).round(3),hide_index=True,use_container_width=True)
+     if audit['volume_change_pct'] is not None:
+      st.metric('Variación entre resoluciones',f"{audit['volume_change_pct']:.1f} %")
+     if audit['ambiguous']:
+      st.error('Sin correspondencia válida entre resoluciones. Se omiten los volúmenes comparativos y su variación; no se valida el bloque.')
+     else:
+      st.info('Correspondencia recíproca provisional. No constituye validación geométrica, de persistencia ni cinemática.')
+    else:st.warning('No se pudo completar la auditoría: '+audit['status'])
+   except Exception as exc:st.error(f'Error de auditoría: {type(exc).__name__}: {exc}')
+ st.divider()
+ if st.button('Ejecutar pruebas geométricas básicas',key='unico_tests'):
+  try:
+   synthetic_tests()
+   result_test=test_region_invariants()
+   st.success(f"Pruebas de conectividad y exclusividad superadas: {result_test['blocks']} regiones de prueba.")
+  except AssertionError:
+   st.error('Una o más pruebas geométricas han fallado.')
