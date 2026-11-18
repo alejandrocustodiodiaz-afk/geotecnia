@@ -5,9 +5,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_geometrico_v17_2 import reconstruct_curved_block, connected_curved_components
+from motor_geometrico_v17_3 import reconstruct_curved_block, connected_curved_components, compare_spatial_components
 
-st.set_page_config(page_title='Geotecnia Mina v17.2 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v17.3 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
 html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
@@ -30,7 +30,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v17.2 experimental')
+st.title('⛏️ GEOTECNIA MINA  ·  v17.3 experimental')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -225,7 +225,7 @@ if not visible:st.error('No se han identificado regiones con los parámetros act
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
-tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.2'])
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.3'])
 
 with tabs[0]:
  c1,c2,c3=st.columns([1.2,1,1])
@@ -539,23 +539,35 @@ with tabs[6]:
 
 
 with tabs[7]:
- st.subheader('Motor v17.2 · componentes conectadas y bóveda curva')
+ st.subheader('Motor v17.3 · correspondencia espacial de bloques')
  st.warning('MOTOR EXPERIMENTAL: la excavación se evalúa con su perfil curvo, pero el volumen se ESTIMA numéricamente. Una celda de planos puede contener varias componentes. No hay persistencia finita, prueba cinemática ni factor de seguridad. NO usar para dimensionamiento.')
  st.write(f"Bloque de referencia: **B{selected['id']}**, {selected['zone']} · volumen voxelizado {selected['volume']:.4f} m³")
 
  st.markdown('### Separación de componentes conectadas (nuevo)')
- st.caption('Se discretiza la celda convexa recortada por la herradura y se identifican regiones de roca conectadas. La componente se asocia al centro del bloque voxelizado. Una misma celda puede contener varias componentes.')
+ st.caption('Se reconstruyen las componentes y se compara su ocupación espacial con las etiquetas de los bloques voxelizados originales. Un centroide dentro de una componente NO demuestra correspondencia.')
  resolutions=st.selectbox('Precisión del análisis de componentes', ['Rápida (36/54/72)', 'Alta (48/72/96)'],index=0,key='v172_resolution')
  if st.button('Identificar componentes de la región seleccionada',key='v172_components'):
   with st.spinner('Separando componentes de roca y comprobando resolución...'):
    rr=(36,54,72) if resolutions.startswith('Rápida') else (48,72,96)
-   comp=connected_curved_components(selected,systems,nplanes,W,H,L,az,resolutions=rr)
+   comp=compare_spatial_components(selected,blocks,labels,xs,ys,zs,systems,nplanes,W,H,L,az,resolutions=rr)
   if comp['status']=='ok':
    ca,cb,cc=st.columns(3)
-   ca.metric('Volumen componente asignada',f"{comp['selected_component_volume']:.4f} m³")
+   ca.metric('Volumen componente candidata (no validado)',f"{comp['selected_component_volume']:.4f} m³")
    cb.metric('Volumen total de celda',f"{comp['total_volume']:.4f} m³")
    cc.metric('Componentes separadas',str(len(comp['components'])))
-   st.write(f"Asociación con B{selected['id']}: **{comp['association']}** · distancia al centro: {comp['association_distance']:.3f} m")
+   st.write(f"Asociación inicial por centroide con B{selected['id']}: **{comp['association']}** · distancia al centro: {comp['association_distance']:.3f} m")
+   st.markdown('#### Correspondencia espacial con los bloques originales')
+   st.caption('Intersección y porcentajes calculados mediante remuestreo de etiquetas voxelizadas: son diagnósticos discretos, NO una prueba geométrica exacta.')
+   if comp['overlap_table']:
+    st.dataframe(pd.DataFrame(comp['overlap_table']).round(3),hide_index=True,use_container_width=True)
+   row=comp.get('selected_overlap')
+   if row is None or row['Celdas coincidentes']==0:
+    st.error('No se ha encontrado solape espacial del bloque seleccionado. Asociación NO validada.')
+   elif comp['collisions']:
+    st.error('ASIGNACIÓN AMBIGUA: el bloque seleccionado y '+', '.join(comp['collisions'])+' se asocian a la misma componente. No utilizar el volumen de esta componente como volumen individual del bloque.')
+   else:
+    st.info('No se ha detectado colisión entre las etiquetas originales presentes en esta celda, pero esto NO valida la correspondencia ni el volumen. Revisar cobertura, pureza y convergencia.')
+   st.warning('El volumen mostrado corresponde a una COMPONENTE reconstruida, no necesariamente a una cuña individual. La correspondencia sigue sin validar.')
    if comp['association']!='centroid_inside_component':
     st.warning('El centro del bloque no cae dentro de una componente del nuevo mallado. Se ha asignado la más próxima: correspondencia NO demostrada.')
    st.dataframe(pd.DataFrame(comp['progress']).round(5),hide_index=True,use_container_width=True)
