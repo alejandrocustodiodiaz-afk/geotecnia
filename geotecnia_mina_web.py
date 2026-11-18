@@ -6,7 +6,7 @@ import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
 
-st.set_page_config(page_title='Geotecnia Mina v16.3', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v16.4', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
 html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
@@ -29,7 +29,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v16.3')
+st.title('⛏️ GEOTECNIA MINA  ·  v16.4')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -231,10 +231,10 @@ with tabs[0]:
  with c1:
   options=sorted(visible,key=lambda b:(b['open'],-b['volume']))
   selected=st.selectbox('Región seleccionada',options,format_func=lambda b:f"B{b['id']} · {b['zone']} · {b['volume']:.2f} m³ · {'abierta' if b['open'] else 'cerrada'}")
- with c2:mode=st.radio('Mostrar', ['Solo seleccionada','Todas las cerradas','Todas las regiones'],horizontal=False)
+ with c2:mode=st.radio('Mostrar regiones', ['Todas las regiones','Todas las cerradas','Solo seleccionada'],horizontal=False,help='Abiertas/cerradas se refiere al borde del dominio, no a la estabilidad')
  with c3:
   scale=st.slider('Escala de análisis de cuña',.5,2.,1.,.05)
-  focus=st.checkbox('Acercar cámara a la cuña',True)
+  focus=st.checkbox('Acercar cámara a la cuña',False)
   quality=st.slider('Calidad de superficie 3D',55,115,85,10)
  st.markdown('#### 👁️ Herramientas de visualización 3D')
  with st.expander('Mostrar / ocultar elementos, etiquetas y cámara',expanded=True):
@@ -255,6 +255,7 @@ with tabs[0]:
   if st.button('Restablecer visualización',key='reset_view'):
    for k,v in {'view_tunnel':True,'view_wedge':True,'view_bolts':True,'view_cables':True,'view_axes':True,'view_grid':False,'view_labels':True,'label_size':17,'camera_view':'Isométrica'}.items():st.session_state[k]=v
    st.rerun()
+ st.caption(f'**Regiones disponibles:** {len(visible)} en contacto; {len(closed)} cerradas y {len(visible)-len(closed)} abiertas. El modo «Todas las regiones» permite comparar su ubicación, pero no indica que sean cuñas desprendibles.')
  st.caption('Escala: transforma una copia visual de la región seleccionada alrededor de su centro; el volumen de escenario se multiplica por escala³. No modifica los planos ni representa una cuña geológicamente demostrada.')
  a,b,c,d=st.columns(4)
  a.metric('Volumen geométrico',f"{selected['volume']:.3f} m³")
@@ -269,15 +270,16 @@ with tabs[0]:
  if view_tunnel:
   for x,z in section[::8]:fig.add_trace(go.Scatter3d(x=[x,x],y=[ymin,ymax],z=[z,z],mode='lines',line=dict(color='#9cc7ed',width=3),showlegend=False,hoverinfo='skip'))
  shown=([selected] if mode=='Solo seleccionada' else ([v for v in visible if not v['open']] if mode=='Todas las cerradas' else visible)) if view_wedge else []
- shown=sorted(shown,key=lambda b:b['volume'],reverse=True)[:35]
+ shown=sorted(shown,key=lambda b:(b['id']!=selected['id'],-b['volume']))[:35]
+ st.caption(f'**Visualización 3D:** {len(shown)} de {len(visible) if mode=="Todas las regiones" else len(closed) if mode=="Todas las cerradas" else 1} regiones del filtro. Verde = seleccionada; otros colores = regiones adicionales. Máximo 35 para mantener fluidez.')
  for j,v in enumerate(shown):
   result=(surface_analytic(labels,v['id'],xs,ys,zs,W,H,L,az,nplanes,json.dumps(systems,sort_keys=True),quality) if not v['open'] else None)
   if result is None:result=surface(labels,v['id'],xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0],xs[0],ys[0],zs[0]);
   if result is None:continue
   verts,faces=result[:2]
   if v['id']==selected['id'] and scale!=1:verts=(verts-np.array(v['center']))*scale+np.array(v['center'])
-  color='#34e3a4' if v['id']==selected['id'] else COL[j%len(COL)]
-  fig.add_trace(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color=color,opacity=.92 if v['id']==selected['id'] else .24,name=f"B{v['id']}",flatshading=True,lighting=dict(ambient=.55,diffuse=.85,specular=.35,roughness=.35,fresnel=.1),hovertemplate=f"B{v['id']}<br>{v['volume']:.2f} m³<extra></extra>"))
+  color='#34e3a4' if v['id']==selected['id'] else {'Bóveda':'#f6bb54','Hastial izq.':'#63b3ed','Hastial der.':'#e99ed8'}.get(v['zone'],COL[j%len(COL)])
+  fig.add_trace(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color=color,opacity=.86 if v['id']==selected['id'] else (.24 if v['open'] else .58),name=f"B{v['id']}",flatshading=True,lighting=dict(ambient=.55,diffuse=.85,specular=.35,roughness=.35,fresnel=.1),hovertemplate=f"B{v['id']} · {v['zone']}<br>{v['volume']:.2f} m³<br>{'Abierta al borde' if v['open'] else 'Cerrada en dominio'}<extra></extra>"))
  def bolts():
   # Anclajes radiales simplificados: puntos en bóveda y hastiales, con estaciones longitudinales.
   arc=np.linspace(np.pi-.12,.12,max(5,round(np.pi*r/boltspace)+1))
@@ -331,6 +333,7 @@ with tabs[0]:
                     projection=dict(type='orthographic'))),showlegend=False)
 
  st.plotly_chart(fig,use_container_width=True)
+ st.caption('Galería azul semitransparente, región seleccionada verde; otras regiones en amarillo (bóveda), azul (hastial izquierdo) o rosa (derecho).')
  st.caption('Galería azul semitransparente, región seleccionada verde; zoom y rotación con el ratón. Las dimensiones y el encuadre pueden ajustarse con los controles.')
  st.caption('Superficie 3D reconstruida mediante ecuaciones de planos y sección de herradura para regiones cerradas; identificación del bloque aún basada en vóxeles. Las caras y volúmenes necesitan verificación geométrica independiente.')
  st.info('La clasificación abierta/cerrada se refiere exclusivamente a los límites del dominio discretizado. No se ha comprobado la liberación cinemática ni la estabilidad.')
