@@ -474,73 +474,88 @@ def rock_mask(X,Z,W,H):
     return ~void
 
 
-def grid_diagnostic(block, labels, xs,ys,zs, systems,nplanes,W,H,L,az, resolution=80):
-    """Reconstructs the plane cell containing the selected voxel block.
-    Explicitly reports when the cell contains multiple original labels.
-    Uses same physical coordinates for all comparisons, no centroid-only matching.
+def grid_diagnostic(block, labels, xs, ys, zs, systems, nplanes, W, H, L, az, resolution=80):
+    """Auditoría por propiedad exclusiva de la etiqueta original.
+
+    No atribuye a B el volumen de una componente reconstruida que contenga
+    otros bloques. La reconstrucción independiente se conserva solo como
+    comprobación de discrepancias, no como geometría ni volumen de B.
     """
-    pl=planes(systems,nplanes,H,az)
-    ident=int(block['id'])
-    idx=np.argwhere(labels==ident)
-    if not len(idx):return {'status':'missing'}
-    # The signature must be identical across a valid original region.
-    samples=idx[np.linspace(0,len(idx)-1,min(len(idx),60),dtype=int)]
-    sigs={signature_at(np.array([xs[i],ys[j],zs[k]]),pl) for i,j,k in samples}
-    if len(sigs)!=1:
-        return {'status':'inconsistent_original_signatures','signatures':len(sigs)}
-    sig=next(iter(sigs))
-    # Limit the integration box to the original region plus a conservative margin.
-    # This is a diagnostic local window, NOT the exact complete cell.
-    lo=idx.min(axis=0);hi=idx.max(axis=0)
-    span0=np.array([xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0]])
-    margin=np.maximum(3*span0,0.75)
-    domainlo=np.array([xs[0],ys[0],zs[0]])
-    domainhi=np.array([xs[-1],ys[-1],zs[-1]])
-    low=np.maximum(domainlo,np.array([xs[lo[0]],ys[lo[1]],zs[lo[2]]])-margin)
-    high=np.minimum(domainhi,np.array([xs[hi[0]],ys[hi[1]],zs[hi[2]]])+margin)
-    step=float(max(high-low)/int(resolution))
-    dims=np.maximum(3,np.ceil((high-low)/step).astype(int))
-    ax=[low[i]+(np.arange(dims[i])+.5)*step for i in range(3)]
-    X,Y,Z=np.meshgrid(*ax,indexing='ij',sparse=True)
-    mask=rock_mask(X,Z,W,H)
-    mask=np.broadcast_to(mask,tuple(dims)).copy()
-    for bit,(_,n,d) in zip(sig,pl):
-        signed=n[0]*X+n[1]*Y+n[2]*Z-d
-        mask &= signed>=-1e-10 if bit else signed < -1e-10
-    cc,num=ndi.label(mask,structure=ndi.generate_binary_structure(3,1))
-    # Compare every candidate component against all original block labels on the same grid.
-    ii=np.rint((ax[0]-xs[0])/span0[0]).astype(int)
-    jj=np.rint((ax[1]-ys[0])/span0[1]).astype(int)
-    kk=np.rint((ax[2]-zs[0])/span0[2]).astype(int)
-    validx=(ii>=0)&(ii<len(xs));validy=(jj>=0)&(jj<len(ys));validz=(kk>=0)&(kk<len(zs))
-    original=np.zeros(tuple(dims),dtype=np.int32)
-    original[np.ix_(validx,validy,validz)]=labels[np.ix_(np.clip(ii[validx],0,len(xs)-1),np.clip(jj[validy],0,len(ys)-1),np.clip(kk[validz],0,len(zs)-1))]
-    counts=[]
-    for c in range(1,num+1):
-        component=cc==c
-        if component.sum()<2:continue
-        unique,numbers=np.unique(original[component],return_counts=True)
-        matched={int(u):int(v) for u,v in zip(unique,numbers) if u>0 and v>0}
-        overlap=matched.get(ident,0)
-        counts.append({'component':c,'volume_m3':float(component.sum()*step**3),
-                       'overlap_selected_m3':float(overlap*step**3),
-                       'purity_pct':100*overlap/max(1,int(component.sum())),
-                       'other_blocks':', '.join('B'+str(u) for u in matched if u!=ident),
-                       'mask':component})
-    if not counts:return {'status':'no_components'}
-    counts.sort(key=lambda d:d['overlap_selected_m3'],reverse=True)
-    chosen=counts[0]
-    original_selected=original==ident
-    intersection=chosen['mask']&original_selected
-    union=chosen['mask']|original_selected
-    coverage=100*intersection.sum()/max(1,original_selected.sum())
-    iou=100*intersection.sum()/max(1,union.sum())
-    return {'status':'ok','signature':sig,'planes':pl,'component_count':len(counts),
-            'components':counts,'chosen':chosen,'coverage_pct':coverage,'iou_pct':iou,
-            'original_resampled_m3':float(original_selected.sum()*step**3),
-            'selected_voxel_m3':float(block['volume']),'origin':low,'step':step,
-            'grid':tuple(dims),'original_mask':original_selected,'intersection_mask':intersection,
-            'window_touches':bool(np.any(chosen['mask'][0]) or np.any(chosen['mask'][-1]) or np.any(chosen['mask'][:,0]) or np.any(chosen['mask'][:,-1]) or np.any(chosen['mask'][:,:,0]) or np.any(chosen['mask'][:,:,-1]))}
+    ident = int(block['id'])
+    idx = np.argwhere(labels == ident)
+    if not len(idx):
+        return {'status': 'missing'}
+    pl = planes(systems, nplanes, H, az)
+    original_sig = int(block.get('signature', -1))
+    # Verificación exhaustiva: no basta con 60 puntos o con el centroide.
+    for bit, (_, n, d) in enumerate(pl):
+        coords = np.column_stack((xs[idx[:, 0]], ys[idx[:, 1]], zs[idx[:, 2]]))
+        actual = (coords @ n >= d)
+        if np.any(actual != bool(original_sig & (1 << bit))):
+            return {'status': 'inconsistent_original_signatures', 'plane': bit + 1}
+    step0 = np.array([xs[1]-xs[0], ys[1]-ys[0], zs[1]-zs[0]], float)
+    margin = np.maximum(3*step0, 0.75)
+    low = np.maximum([xs[0], ys[0], zs[0]],
+                     np.array([xs[idx[:,0].min()], ys[idx[:,1].min()], zs[idx[:,2].min()]])-margin)
+    high = np.minimum([xs[-1], ys[-1], zs[-1]],
+                      np.array([xs[idx[:,0].max()], ys[idx[:,1].max()], zs[idx[:,2].max()]])+margin)
+    step = float(max(high-low)/int(resolution))
+    dims = np.maximum(3, np.ceil((high-low)/step).astype(int))
+    if int(np.prod(dims)) > 3000000:
+        return {'status': 'too_large'}
+    ax = [low[i]+(np.arange(dims[i])+.5)*step for i in range(3)]
+    X,Y,Z = np.meshgrid(*ax,indexing='ij',sparse=True)
+    reconstructed = np.broadcast_to(rock_mask(X,Z,W,H),tuple(dims)).copy()
+    for bit,(_,n,d) in enumerate(pl):
+        signed = n[0]*X+n[1]*Y+n[2]*Z-d
+        reconstructed &= signed >= 0 if (original_sig & (1 << bit)) else signed < 0
+    # Propietario de cada punto según la única segmentación de referencia.
+    ix = np.rint((ax[0]-xs[0])/step0[0]).astype(int)
+    iy = np.rint((ax[1]-ys[0])/step0[1]).astype(int)
+    iz = np.rint((ax[2]-zs[0])/step0[2]).astype(int)
+    valid = ((ix[:,None,None]>=0)&(ix[:,None,None]<len(xs)) &
+             (iy[None,:,None]>=0)&(iy[None,:,None]<len(ys)) &
+             (iz[None,None,:]>=0)&(iz[None,None,:]<len(zs)))
+    owner = labels[np.ix_(np.clip(ix,0,len(xs)-1),np.clip(iy,0,len(ys)-1),np.clip(iz,0,len(zs)-1))].copy()
+    owner[~valid]=0
+    original_mask = owner==ident
+    owned = reconstructed & original_mask
+    structure = ndi.generate_binary_structure(3,1)
+    components,ncomp = ndi.label(owned,structure=structure)
+    records=[]
+    for c in range(1,ncomp+1):
+        cm=components==c
+        if not cm.any(): continue
+        records.append({'component':c,'volume_m3':float(cm.sum()*step**3),
+                        'overlap_selected_m3':float(cm.sum()*step**3),
+                        'purity_pct':100.,'other_blocks':'','mask':cm})
+    records.sort(key=lambda x:-x['volume_m3'])
+    if not records:return {'status':'no_components'}
+    chosen=records[0]
+    # La cobertura evalúa la pérdida por recorte de planos y herradura.
+    coverage=100*owned.sum()/max(1,original_mask.sum())
+    # Fracción de la componente independiente que pertenece a B (diagnóstico).
+    independent,ni=ndi.label(reconstructed,structure=structure)
+    overlap=np.bincount(independent[owned],minlength=ni+1)
+    overlap[0]=0
+    cid=int(np.argmax(overlap)) if ni else 0
+    candidate=independent==cid if cid else np.zeros_like(owned)
+    foreign_ids=np.unique(owner[candidate & (owner>0) & (owner!=ident)])
+    foreign=[f'B{int(x)}' for x in foreign_ids]
+    purity=100*float((candidate & owned).sum())/max(1,int(candidate.sum()))
+    touches=bool(any(np.any(v) for v in (owned[0],owned[-1],owned[:,0],owned[:,-1],owned[:,:,0],owned[:,:,-1])))
+    return {'status':'ok','signature':original_sig,'planes':pl,
+            'component_count':len(records),'components':records,'chosen':chosen,
+            'coverage_pct':coverage,'iou_pct':100*owned.sum()/max(1,(original_mask|owned).sum()),
+            'original_resampled_m3':float(original_mask.sum()*step**3),
+            'owned_volume_m3':float(owned.sum()*step**3),
+            'selected_voxel_m3':float(block['volume']),
+            'origin':low,'step':step,'grid':tuple(dims),
+            'original_mask':original_mask,'intersection_mask':owned,
+            'owned_mask':owned,'independent_mask':candidate,
+            'foreign_blocks':foreign,'independent_purity_pct':purity,
+            'window_touches':touches,
+            'note':'Volumen de submuestreo condicionado a etiqueta original, no volumen exacto independiente.'}
 
 
 def synthetic_tests():
