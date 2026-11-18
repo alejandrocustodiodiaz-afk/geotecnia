@@ -7,9 +7,13 @@ from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
 from motor_geometrico_v17_4 import reconstruct_curved_block, connected_curved_components, compare_spatial_components, reconstruct_labeled_block, diagnose_independent_block
 
-st.set_page_config(page_title='Geotecnia Mina v17.5 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v17.6 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
-[data-testid="stAlert"] p,[data-testid="stAlert"] span,[data-testid="stAlert"] div{color:#182337!important}
+/* Avisos: contraste legible incluso con tema oscuro */
+[data-testid="stAlert"]{border:1px solid #b5a36b!important}
+[data-testid="stAlert"] p,[data-testid="stAlert"] span,[data-testid="stAlert"] div,
+[data-testid="stAlert"] [data-testid="stMarkdownContainer"] *{color:#1d2939!important}
+[data-testid="stAlert"] svg{color:#25374c!important}
 .stButton button{color:#152235!important;font-weight:650!important}
 
 /* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
@@ -33,7 +37,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v17.5 experimental')
+st.title('⛏️ GEOTECNIA MINA  ·  v17.6 experimental')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -568,7 +572,7 @@ with tabs[7]:
      fig=go.Figure(go.Mesh3d(x=v[:,0],y=v[:,1],z=v[:,2],i=f[:,0],j=f[:,1],k=f[:,2],
                   color='#40c7a3',opacity=.96,flatshading=True,name=f"B{selected['id']}"))
      fig.update_layout(height=540,paper_bgcolor='#0b1421',font_color='white',
-        scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white'),
+        scene=dict(bgcolor='#0b1421',aspectmode='data',camera=dict(eye=dict(x=1.5,y=-1.7,z=1.05),projection=dict(type='orthographic')),xaxis=dict(title='X (m)',color='white'),
         yaxis=dict(title='Y (m)',color='white'),zaxis=dict(title='Z (m)',color='white')))
      st.plotly_chart(fig,use_container_width=True)
    except (ValueError,RuntimeError) as exc:
@@ -616,7 +620,7 @@ with tabs[7]:
                 i=tri[:,0],j=tri[:,1],k=tri[:,2],color='#38d9a9',opacity=.95,flatshading=True,
                 name=f"Componente B{selected['id']}"))
      fig.update_layout(height=560,paper_bgcolor='#0b1421',font_color='white',
-           scene=dict(bgcolor='#0b1421',aspectmode='data',
+           scene=dict(bgcolor='#0b1421',aspectmode='data',camera=dict(eye=dict(x=1.5,y=-1.7,z=1.05),projection=dict(type='orthographic')),
            xaxis=dict(title='X (m)',color='white',nticks=4),
            yaxis=dict(title='Y (m)',color='white',nticks=4),
            zaxis=dict(title='Z (m)',color='white',nticks=4)))
@@ -658,7 +662,7 @@ with tabs[7]:
    g=go.Figure()
    g.add_trace(go.Mesh3d(x=vertices[:,0],y=vertices[:,1],z=vertices[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color='#38d9a9',opacity=.45,flatshading=True,name='Celda completa'))
    g.add_trace(go.Scatter3d(x=vertices[:,0],y=vertices[:,1],z=vertices[:,2],mode='markers',marker=dict(color='white',size=4),name='Vértices'))
-   g.update_layout(height=620,paper_bgcolor='#0b1421',font_color='white',scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white',nticks=4),yaxis=dict(title='Y (m)',color='white',nticks=4),zaxis=dict(title='Z (m)',color='white',nticks=4)))
+   g.update_layout(height=620,paper_bgcolor='#0b1421',font_color='white',scene=dict(bgcolor='#0b1421',aspectmode='data',camera=dict(eye=dict(x=1.5,y=-1.7,z=1.05),projection=dict(type='orthographic')),xaxis=dict(title='X (m)',color='white',nticks=4),yaxis=dict(title='Y (m)',color='white',nticks=4),zaxis=dict(title='Z (m)',color='white',nticks=4)))
    st.plotly_chart(g,use_container_width=True)
    df_out=pd.DataFrame(result['progress'])
    st.download_button('Exportar convergencia CSV',df_out.to_csv(index=False).encode('utf-8-sig'),f"B{selected['id']}_convergencia_v17_1.csv",'text/csv')
@@ -670,7 +674,7 @@ with tabs[7]:
 
 # v17.5: diagnóstico independiente de la etiqueta voxelizada.
 st.divider()
-st.header('🔬 Motor v17.5 · reconstrucción independiente y comparación 3D')
+st.header('🔬 Motor v17.6 · comparación geométrica y contexto de galería')
 st.caption('El modelo independiente reconstruye componentes a partir de planos y perfil de excavación. Las etiquetas B se emplean solo DESPUÉS para comparar. La geometría continúa discretizada y no incorpora persistencia finita ni liberación cinemática.')
 mode175=st.selectbox('Precisión del diagnóstico independiente',
                      ['Rápida (30/45/60)','Alta (36/54/72)','Muy alta (48/72/96)'],
@@ -699,11 +703,22 @@ if st.button('Analizar bloque y comparar geometrías',key='v175_run'):
    st.markdown('**Otros bloques originales que comparten la componente reconstruida**')
    st.dataframe(pd.DataFrame(diag['collisions']).round(3),hide_index=True,use_container_width=True)
   st.markdown('#### Comparación 3D de las dos geometrías')
+  colview1,colview2,colview3=st.columns(3)
+  with colview1:
+   show_gallery176=st.checkbox('Mostrar galería semitransparente',value=True,key='v176_gallery')
+  with colview2:
+   smooth176=st.checkbox('Interpolación visual de superficie',value=True,key='v176_smooth',help='Solo modifica la visualización, no los volúmenes ni los indicadores calculados.')
+  with colview3:
+   edges176=st.checkbox('Mostrar perfiles de la galería',value=True,key='v176_edges')
+  st.caption('Naranja = bloque original remuestreado; verde = componente independiente. La interpolación es únicamente gráfica: NO corrige la geometría ni el volumen.')
   view175=st.radio('Mostrar', ['Ambas superpuestas','Solo original','Solo independiente'],horizontal=True,key='v175_view')
   fig175=go.Figure()
   def add_mask175(mask,color,opacity,name):
    if not np.any(mask):return
-   padded=np.pad(mask.astype(np.uint8),1)
+   padded=np.pad(mask.astype(np.float32),1)
+   if smooth176:
+    from scipy.ndimage import gaussian_filter
+    padded=gaussian_filter(padded,sigma=.65)
    verts,faces,_,_=marching_cubes(padded,level=.5,spacing=(diag['step'],)*3)
    verts+=diag['origin']-.5*diag['step']
    fig175.add_trace(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],
@@ -713,11 +728,26 @@ if st.button('Analizar bloque y comparar geometrías',key='v175_run'):
    add_mask175(diag['original_mask'],'#ffbf69',.45 if view175=='Ambas superpuestas' else .95,'B original remuestreado')
   if view175!='Solo original':
    add_mask175(diag['candidate_mask'],'#40d6b0',.65 if view175=='Ambas superpuestas' else .95,'Componente independiente')
-  fig175.update_layout(height=620,paper_bgcolor='#0b1421',font_color='#f1f5f9',
+  if show_gallery176:
+   # Perfil real de la sección extruido en el eje longitudinal. Solo contexto visual.
+   ycenter=float(selected['center'][1])
+   ylo=max(0.,ycenter-2.5);yhi=min(L,ycenter+2.5)
+   gverts,gfaces=tunnel_surface(section,ylo,yhi)
+   fig175.add_trace(go.Mesh3d(x=gverts[:,0],y=gverts[:,1],z=gverts[:,2],
+       i=gfaces[:,0],j=gfaces[:,1],k=gfaces[:,2],
+       name='Galería (referencia)',color='#92bce0',opacity=.10,
+       hoverinfo='skip',showlegend=True))
+   if edges176:
+    for station in (ylo,yhi):
+     fig175.add_trace(go.Scatter3d(x=section[:,0],y=np.full(len(section),station),
+       z=section[:,1],mode='lines',line=dict(color='#c7e4ff',width=5),
+       name='Perfil galería',showlegend=False,hoverinfo='skip'))
+  fig175.update_layout(height=680,paper_bgcolor='#0b1421',font_color='#f1f5f9',
       legend=dict(font=dict(color='white')),
-      scene=dict(bgcolor='#0b1421',aspectmode='data',
+      scene=dict(bgcolor='#0b1421',aspectmode='data',camera=dict(eye=dict(x=1.5,y=-1.7,z=1.05),projection=dict(type='orthographic')),
         xaxis=dict(title='X (m)',color='white'),yaxis=dict(title='Y (m)',color='white'),
         zaxis=dict(title='Z (m)',color='white')),
       margin=dict(l=0,r=0,t=25,b=0))
   st.plotly_chart(fig175,use_container_width=True)
+  st.caption('La malla interpolada se utiliza solo para visualizar. Los volúmenes se calculan con la discretización original de cada diagnóstico.')
   st.warning('EXPERIMENTAL: independencia respecto a etiquetas no significa geometría exacta. Los planos se consideran infinitamente persistentes; no se evalúan mecanismos de caída, FS ni sostenimiento. No usar para dimensionamiento.')
