@@ -5,9 +5,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_geometrico_v17_1 import reconstruct_curved_block
+from motor_geometrico_v17_2 import reconstruct_curved_block, connected_curved_components
 
-st.set_page_config(page_title='Geotecnia Mina v17.0 alfa', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v17.2 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
 html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
@@ -30,7 +30,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v17.0 alfa')
+st.title('⛏️ GEOTECNIA MINA  ·  v17.2 experimental')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -225,7 +225,7 @@ if not visible:st.error('No se han identificado regiones con los parámetros act
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
-tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.1'])
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.2'])
 
 with tabs[0]:
  c1,c2,c3=st.columns([1.2,1,1])
@@ -539,9 +539,51 @@ with tabs[6]:
 
 
 with tabs[7]:
- st.subheader('Motor v17.1 · comprobación con bóveda curva')
+ st.subheader('Motor v17.2 · componentes conectadas y bóveda curva')
  st.warning('MOTOR EXPERIMENTAL: la excavación se evalúa con su perfil curvo, pero el volumen se ESTIMA numéricamente. Una celda de planos puede contener varias componentes. No hay persistencia finita, prueba cinemática ni factor de seguridad. NO usar para dimensionamiento.')
  st.write(f"Bloque de referencia: **B{selected['id']}**, {selected['zone']} · volumen voxelizado {selected['volume']:.4f} m³")
+
+ st.markdown('### Separación de componentes conectadas (nuevo)')
+ st.caption('Se discretiza la celda convexa recortada por la herradura y se identifican regiones de roca conectadas. La componente se asocia al centro del bloque voxelizado. Una misma celda puede contener varias componentes.')
+ resolutions=st.selectbox('Precisión del análisis de componentes', ['Rápida (36/54/72)', 'Alta (48/72/96)'],index=0,key='v172_resolution')
+ if st.button('Identificar componentes de la región seleccionada',key='v172_components'):
+  with st.spinner('Separando componentes de roca y comprobando resolución...'):
+   rr=(36,54,72) if resolutions.startswith('Rápida') else (48,72,96)
+   comp=connected_curved_components(selected,systems,nplanes,W,H,L,az,resolutions=rr)
+  if comp['status']=='ok':
+   ca,cb,cc=st.columns(3)
+   ca.metric('Volumen componente asignada',f"{comp['selected_component_volume']:.4f} m³")
+   cb.metric('Volumen total de celda',f"{comp['total_volume']:.4f} m³")
+   cc.metric('Componentes separadas',str(len(comp['components'])))
+   st.write(f"Asociación con B{selected['id']}: **{comp['association']}** · distancia al centro: {comp['association_distance']:.3f} m")
+   if comp['association']!='centroid_inside_component':
+    st.warning('El centro del bloque no cae dentro de una componente del nuevo mallado. Se ha asignado la más próxima: correspondencia NO demostrada.')
+   st.dataframe(pd.DataFrame(comp['progress']).round(5),hide_index=True,use_container_width=True)
+   st.markdown('**Componentes de la celda en la resolución final**')
+   st.dataframe(pd.DataFrame(comp['components']).round(5),hide_index=True,use_container_width=True)
+   if comp['components']:
+    try:
+     m=comp['component_mask']
+     padded=np.pad(m.astype(np.uint8),1)
+     verts,tri,_,_=marching_cubes(padded,level=.5,spacing=(comp['grid_step'],)*3)
+     verts += comp['grid_origin'] - .5*comp['grid_step']
+     fig=go.Figure(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],
+                i=tri[:,0],j=tri[:,1],k=tri[:,2],color='#38d9a9',opacity=.95,flatshading=True,
+                name=f"Componente B{selected['id']}"))
+     fig.update_layout(height=560,paper_bgcolor='#0b1421',font_color='white',
+           scene=dict(bgcolor='#0b1421',aspectmode='data',
+           xaxis=dict(title='X (m)',color='white',nticks=4),
+           yaxis=dict(title='Y (m)',color='white',nticks=4),
+           zaxis=dict(title='Z (m)',color='white',nticks=4)))
+     st.plotly_chart(fig,use_container_width=True)
+    except (ValueError,RuntimeError) as exc:
+     st.warning(f'No se pudo dibujar la componente: {exc}')
+   st.warning('El volumen sigue dependiendo de la resolución. No es un volumen geométrico exacto ni valida la liberación de la cuña.')
+  else:
+   st.error(f"No se pudieron identificar componentes: {comp['status']}")
+ st.divider()
+ st.markdown('### Comparación de la celda completa con muestreo Sobol (v17.1)')
+
  c1,c2=st.columns(2)
  with c1:
   power=st.select_slider('Precisión de muestreo (potencia de 2)',options=[12,13,14,15,16,17],value=16,key='v171_power')
