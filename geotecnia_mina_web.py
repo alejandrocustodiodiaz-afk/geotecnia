@@ -37,7 +37,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v21 · motor único')
+st.title('⛏️ GEOTECNIA MINA  ·  v23 · auditoría coherente')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones y sus superficies 3D se obtienen de la misma segmentación voxel, sin reconstrucciones visuales contradictorias. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -512,9 +512,9 @@ with tabs[5]:
  st.info('No se reproduce el FS simplificado de GeologgIA: la estabilidad requiere comprobar cinemática, fuerzas y sostenimiento efectivo.')
 
 with tabs[6]:
- data={'version':'21.0 motor único (experimental)','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
- st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v21.json','application/json')
- st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v21.csv','text/csv')
+ data={'version':'23.0 motor único (experimental)','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
+ st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v23.json','application/json')
+ st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v23.csv','text/csv')
  st.caption('Exportaciones de datos geométricos preliminares. No constituyen informe de diseño.')
 
 
@@ -544,30 +544,30 @@ with tabs[7]:
   else:
    chosen=check['chosen']
    c1,c2,c3,c4=st.columns(4)
-   c1.metric('Componentes en ventana',check['component_count'])
+   c1.metric('Componentes de B en ventana',check['component_count'])
    c2.metric('Cobertura del bloque',f"{check['coverage_pct']:.1f} %")
-   c3.metric('Coincidencia espacial (IoU)',f"{check['iou_pct']:.1f} %")
-   c4.metric('Pureza de componente',f"{chosen['purity_pct']:.1f} %")
+   c3.metric('Volumen B en ventana',f"{check['owned_volume_m3']:.4f} m³")
+   c4.metric('Pureza B en componente independiente',f"{check['independent_purity_pct']:.1f} %")
    st.dataframe(pd.DataFrame([{k:v for k,v in item.items() if k!='mask'} for item in check['components']]).round(4),hide_index=True,use_container_width=True)
    if check['window_touches']:
-    st.error('La componente alcanza el borde de la ventana de comprobación: su volumen no es total.')
-   if chosen['other_blocks']:
-    st.error('La componente comparte espacio con otros bloques: '+chosen['other_blocks']+'. No se le asigna un volumen independiente.')
-   if check['iou_pct']<80:
-    st.warning('Identidad geométrica sin validar: la coincidencia espacial es insuficiente.')
-   else:
-    st.info('Coincidencia espacial favorable en esta resolución; pendiente validación geométrica y cinemática.')
-   st.caption('Los volúmenes de componentes de la tabla son exclusivamente diagnósticos de la ventana local. El volumen de referencia mostrado arriba no cambia.')
+    st.warning('La porción de B alcanza el borde de la ventana: el volumen local puede ser parcial.')
+   if check['foreign_blocks']:
+    st.warning('La reconstrucción independiente agrupa otras etiquetas: '+', '.join(check['foreign_blocks'])+'. NO se incorporan a B. Esto señala una discrepancia de conectividad entre resoluciones, no un solapamiento físico de volúmenes asignados.')
+   if check['component_count']>1:
+    st.warning('La región de referencia se divide en varias componentes al remuestrear. Comprobar la sensibilidad a la resolución.')
+   if check['coverage_pct']<90:
+    st.warning('Parte de la etiqueta original queda fuera de los límites geométricos evaluados. Identidad sin validar.')
+   st.caption('La auditoría respeta la propiedad exclusiva de cada etiqueta. Su volumen local no sustituye el volumen principal; la pureza independiente es solo una comparación entre métodos.')
    st.subheader('Superposición de comprobación 3D')
    figcheck=go.Figure()
-   for maskcheck,colcheck,titlecheck,opcheck in [(check['original_mask'],'#f7b955','Bloque de referencia',.55),(chosen['mask'],'#34d6aa','Componente diagnóstica',.35)]:
+   for maskcheck,colcheck,titlecheck,opcheck in [(check['original_mask'],'#f7b955','Etiqueta de referencia',.45),(check['owned_mask'],'#34d6aa','Parte de B que cumple los planos',.75)]:
     if maskcheck.sum()>3:
      vv,ff,_,_=marching_cubes(np.pad(maskcheck.astype(np.float32),1),.5,spacing=(check['step'],)*3)
      vv+=check['origin']-.5*check['step']
      figcheck.add_trace(go.Mesh3d(x=vv[:,0],y=vv[:,1],z=vv[:,2],i=ff[:,0],j=ff[:,1],k=ff[:,2],color=colcheck,opacity=opcheck,name=titlecheck,flatshading=True))
    figcheck.update_layout(height=560,paper_bgcolor='#0b1421',font_color='white',margin=dict(l=0,r=0,t=20,b=0),scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white'),yaxis=dict(title='Y (m)',color='white'),zaxis=dict(title='Z (m)',color='white')))
    st.plotly_chart(figcheck,use_container_width=True)
-   st.caption('Superficies voxelizadas de comparación, no geometrías exactas. El zoom general de la aplicación permanece sin cambios.')
+   st.caption('Visualización voxelizada: comparación de la misma etiqueta, sin fusionarla con B15/B16 u otras regiones.')
  st.divider()
  st.subheader('Auditoría de resolución e identidad del bloque')
  st.caption('Compara el bloque seleccionado entre dos discretizaciones nuevas mediante correspondencia espacial, sin suponer que los identificadores B sean constantes.')
