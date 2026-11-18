@@ -582,3 +582,57 @@ def compute_regions(W,H,L,az,res,nplanes,systems_json):
    contact=[float(xs[0]+tc[0]*(xs[1]-xs[0])),float(ys[0]+tc[1]*(ys[1]-ys[0])),float(zs[0]+tc[2]*(zs[1]-zs[0]))]
    blocks.append(dict(id=ident,zone=zone,volume=count*voxel,open=opened,center=center,contact=contact))
  return xs,ys,zs,labels,blocks
+
+
+def compare_block_resolution(block, xs, ys, zs, labels, W, H, L, az,
+                             nplanes, systems_json, resolutions=(48, 72)):
+    """Cross-resolution overlap audit; IDs are NOT assumed stable between grids.
+
+    Compare the original block on its original voxel centres to the nearest
+    labelled cell of a freshly computed grid. Report splitting and merging.
+    This is a discretization diagnostic, not an exact volume validation.
+    """
+    source = np.argwhere(labels == int(block['id']))
+    if len(source) == 0:
+        return {'status': 'missing'}
+    # Deterministic evenly spaced sampling prevents excessive memory use.
+    if len(source) > 20000:
+        source = source[np.linspace(0, len(source)-1, 20000, dtype=int)]
+    points = np.column_stack((xs[source[:, 0]], ys[source[:, 1]], zs[source[:, 2]]))
+    history = []
+    for resolution in resolutions:
+        ax, ay, azz, newlabels, newblocks = compute_regions(
+            W, H, L, az, int(resolution), nplanes, systems_json)
+        ii = np.clip(np.rint((points[:, 0]-ax[0])/(ax[1]-ax[0])).astype(int), 0, len(ax)-1)
+        jj = np.clip(np.rint((points[:, 1]-ay[0])/(ay[1]-ay[0])).astype(int), 0, len(ay)-1)
+        kk = np.clip(np.rint((points[:, 2]-azz[0])/(azz[1]-azz[0])).astype(int), 0, len(azz)-1)
+        values, counts = np.unique(newlabels[ii, jj, kk], return_counts=True)
+        matches = sorted(((int(v), int(c)) for v, c in zip(values, counts) if v > 0),
+                         key=lambda x: -x[1])
+        if not matches:
+            history.append({'Resolución': int(resolution), 'Bloque equivalente': 'No encontrado',
+                            'Volumen (m³)': None, 'Cobertura (%)': 0.,
+                            'Otros bloques coincidentes': 0, 'Pureza inversa (%)': None})
+            continue
+        bid, matched = matches[0]
+        other = sum(1 for _, count in matches[1:] if count >= max(2, int(.01*len(points))))
+        candidate = next(b for b in newblocks if b['id'] == bid)
+        # Check how much of the new candidate belongs to original source block.
+        candidate_points = np.argwhere(newlabels == bid)
+        if len(candidate_points) > 20000:
+            candidate_points = candidate_points[np.linspace(0, len(candidate_points)-1, 20000, dtype=int)]
+        orig_i = np.clip(np.rint((ax[candidate_points[:, 0]]-xs[0])/(xs[1]-xs[0])).astype(int), 0, len(xs)-1)
+        orig_j = np.clip(np.rint((ay[candidate_points[:, 1]]-ys[0])/(ys[1]-ys[0])).astype(int), 0, len(ys)-1)
+        orig_k = np.clip(np.rint((azz[candidate_points[:, 2]]-zs[0])/(zs[1]-zs[0])).astype(int), 0, len(zs)-1)
+        purity = 100*float(np.mean(labels[orig_i, orig_j, orig_k] == int(block['id'])))
+        history.append({'Resolución': int(resolution), 'Bloque equivalente': f'B{bid}',
+                        'Volumen (m³)': float(candidate['volume']),
+                        'Cobertura (%)': 100*matched/len(points),
+                        'Otros bloques coincidentes': other, 'Pureza inversa (%)': purity})
+    volumes = [row['Volumen (m³)'] for row in history if row['Volumen (m³)'] is not None]
+    delta = 100*abs(volumes[-1]-volumes[-2])/max(volumes[-1], 1e-12) if len(volumes) > 1 else None
+    ambiguous = any(row['Cobertura (%)'] < 90 or row['Otros bloques coincidentes'] > 0
+                    or row['Pureza inversa (%)'] is None or row['Pureza inversa (%)'] < 90
+                    for row in history)
+    return {'status': 'ok', 'history': history, 'volume_change_pct': delta,
+            'ambiguous': ambiguous, 'validated': False}
