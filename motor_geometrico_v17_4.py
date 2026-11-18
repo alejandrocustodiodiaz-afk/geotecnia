@@ -363,3 +363,70 @@ def compare_spatial_components(block, blocks, original_labels, xs, ys, zs,
                    'collisions':collisions,'compared_block_count':len(relevant),
                    'mapping_validated':False})
     return result
+
+
+
+def reconstruct_labeled_block(block, original_labels, xs, ys, zs, systems,
+                              nplanes, W, H, L, az, factors=(1, 2, 3)):
+    """Refine one ORIGINAL labeled region, preserving its voxel identity.
+
+    Original label is a topological prior; plane and curved excavation boundaries
+    are re-evaluated at finer sample centers. This is NOT an independent exact
+    polyhedron, and cannot resolve a missed or incorrectly split original region.
+    """
+    import numpy as np
+    from scipy import ndimage as ndi
+    bid = int(block['id'])
+    inds = np.argwhere(original_labels == bid)
+    if not len(inds):
+        return {'status':'missing_label'}
+    axes0 = [np.asarray(a,float) for a in (xs,ys,zs)]
+    steps0 = np.array([abs(a[1]-a[0]) for a in axes0])
+    lo = np.maximum(inds.min(axis=0)-1, 0)
+    hi = np.minimum(inds.max(axis=0)+1, np.array(original_labels.shape)-1)
+    # Only evaluate a padded neighborhood of the selected block.
+    # The original labels are the ownership mask; no other B can be included.
+    local = original_labels[lo[0]:hi[0]+1,lo[1]:hi[1]+1,lo[2]:hi[2]+1]
+    if local.size > 1200000:
+        return {'status':'too_large','detail':'Reduce el dominio o la resolución inicial'}
+    sample = np.asarray(block['center'],float)
+    hs,names = cell_halfspaces(systems,nplanes,W,H,L,az,sample)
+    progress=[]; last=None
+    for factor in factors:
+        factor=int(factor)
+        if factor<1 or factor>5: raise ValueError('Factor fuera de rango')
+        # Subdivide each original voxel into factor^3 cells, with the same physical extent.
+        orig_index=[np.repeat(np.arange(lo[d],hi[d]+1),factor) for d in range(3)]
+        fine_axes=[axes0[d][orig_index[d]] +
+                   ((np.tile(np.arange(factor),hi[d]-lo[d]+1)+.5)/factor-.5)*steps0[d]
+                   for d in range(3)]
+        x,y,z=np.meshgrid(*fine_axes,indexing='ij',sparse=True)
+        owned=(local==bid).repeat(factor,axis=0).repeat(factor,axis=1).repeat(factor,axis=2)
+        # Planar constraints use the same cell containing the selected block center.
+        for h in hs:
+            owned &= (h[0]*x+h[1]*y+h[2]*z+h[3] <= 1.e-9)
+        r=W/2.; spring=max(0.,H-r)
+        inside=(np.abs(x)<=r)&((z<=spring)|((x*x+(z-spring)**2)<=r*r))
+        owned &= ~inside
+        n=int(owned.sum())
+        vol=n*float(np.prod(steps0))/factor**3
+        cc,ncomp=ndi.label(owned,ndi.generate_binary_structure(3,1))
+        counts=np.bincount(cc.ravel(),minlength=ncomp+1)
+        if len(counts): counts[0]=0
+        largest=int(np.max(counts)) if ncomp else 0
+        progress.append({'Subdivisión por eje':factor,
+                         'Celdas de bloque':n,
+                         'Volumen individual estimado (m³)':float(vol),
+                         'Componentes internas':int(ncomp),
+                         'Fracción componente mayor (%)':float(100*largest/max(n,1))})
+        last={'mask':owned,'origin':np.array([a[0] for a in fine_axes]),
+              'spacing':steps0/factor,'components':int(ncomp)}
+    return {'status':'ok','block_id':bid,'progress':progress,
+            'individual_volume':progress[-1]['Volumen individual estimado (m³)'],
+            'original_volume':float(block['volume']),
+            'difference_pct':100*(progress[-1]['Volumen individual estimado (m³)']/block['volume']-1) if block['volume'] else None,
+            'mask':last['mask'],'origin':last['origin'],'spacing':last['spacing'],
+            'halfspace_names':names,
+            'validated':False,
+            'method':'Subdivisión de etiquetas originales y reevaluación de límites geométricos',
+            'warning':'Volumen experimental condicionado a la segmentación original; no equivale a reconstrucción exacta independiente.'}
