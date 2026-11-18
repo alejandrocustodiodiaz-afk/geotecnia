@@ -1,0 +1,298 @@
+"""Motor v17.1 experimental: celdas de discontinuidades + integración de bóveda curva.
+La superficie de excavación se evalúa con su ecuación curva exacta; el volumen se
+estima numéricamente mediante muestreo cuasi-Monte Carlo, NO es volumen exacto.
+No modela persistencia finita, liberación cinemática ni factor de seguridad.
+"""
+import numpy as np
+from scipy.optimize import linprog
+from scipy.spatial import HalfspaceIntersection, ConvexHull, QhullError
+from scipy.stats import qmc
+
+
+def normal_local(dd, dip, az=0):
+    a, b = np.deg2rad([(dd-az) % 360, dip])
+    return np.array([np.sin(a)*np.sin(b), np.cos(a)*np.sin(b), np.cos(b)])
+
+
+def cell_halfspaces(systems, nplanes, W, H, L, az, sample):
+    """Semiespacios de la celda que contiene sample; límites de dominio incluidos."""
+    sample = np.asarray(sample, float)
+    halfspaces, names = [], []
+    for j, fam in enumerate(systems, 1):
+        n = normal_local(fam['dd'], fam['dip'], az)
+        base = float(n @ np.array([fam['xx'], fam['yy'], H]))
+        levels = [base+(k-(nplanes-1)/2)*fam['spacing'] for k in range(nplanes)]
+        # Solo las dos discontinuidades adyacentes pueden delimitar esta celda.
+        # Evita planos redundantes y permite atribuir correctamente las caras.
+        proj = float(n @ sample)
+        below = [(k, lev) for k, lev in enumerate(levels) if lev <= proj]
+        above = [(k, lev) for k, lev in enumerate(levels) if lev > proj]
+        if below:
+            k, lev = max(below, key=lambda t: t[1])
+            halfspaces.append(np.r_[-n, lev]); names.append(f'J{j} plano {k+1} (inferior)')
+        if above:
+            k, lev = min(above, key=lambda t: t[1])
+            halfspaces.append(np.r_[n, -lev]); names.append(f'J{j} plano {k+1} (superior)')
+    r = W/2; margin = max(2., W*.5)
+    for i, (lo, hi), name in zip(range(3), [(-r-margin,r+margin),(0,L),(0,H+margin)], ['X','Y','Z']):
+        unit = np.eye(3)[i]
+        halfspaces.extend([np.r_[-unit,lo], np.r_[unit,-hi]])
+        names.extend([f'Dominio {name} mínimo', f'Dominio {name} máximo'])
+    return np.asarray(halfspaces, float), names
+
+
+def convex_polyhedron(halfspaces):
+    A = halfspaces[:,:3]; d = halfspaces[:,3]
+    norms = np.linalg.norm(A, axis=1)
+    res = linprog([0,0,0,-1], A_ub=np.column_stack([A,norms]), b_ub=-d,
+                  bounds=[(None,None)]*4, method='highs')
+    if not res.success or res.x[3] < 1.e-8:
+        return {'status':'empty_or_degenerate','detail':res.message}
+    try:
+        hs = HalfspaceIntersection(halfspaces, res.x[:3], qhull_options='Qx')
+        vertices = np.unique(np.round(hs.intersections, 10), axis=0)
+        hull = ConvexHull(vertices)
+    except (QhullError, ValueError) as exc:
+        return {'status':'geometry_error','detail':str(exc)}
+    return {'status':'ok','vertices':vertices,'faces':hull.simplices,
+            'volume':float(hull.volume),'area':float(hull.area),
+            'interior':res.x[:3], 'clearance':float(res.x[3])}
+
+
+def outside_horseshoe(points, W, H):
+    """Puntos de roca, fuera del hueco de herradura extruido (solera incluida)."""
+    x, z = points[:,0], points[:,2]
+    r = W/2.; spring = max(0., H-r)
+    in_void = (np.abs(x) <= r) & ((z <= spring) | (x*x+(z-spring)**2 <= r*r))
+    return ~in_void
+
+
+def _tetra_sampling(vertices, faces, interior, n, seed):
+    """Muestreo uniforme de un poliedro convexo, triangulado desde un punto interior."""
+    tri = vertices[faces]
+    edges = tri[:,1:,:] - tri[:,:1,:]
+    cross = np.cross(edges[:,0,:], edges[:,1,:])
+    vol = np.abs(np.einsum('ij,ij->i',cross,tri[:,0,:]-interior))/6.
+    good = vol > 1.e-13
+    tri, vol = tri[good], vol[good]
+    if len(vol) == 0: raise ValueError('No hay tetraedros de volumen positivo')
+    cum = np.cumsum(vol)/vol.sum()
+    m = int(np.log2(n))
+    u = qmc.Sobol(d=5, scramble=True, seed=seed).random_base2(m)
+    ids = np.searchsorted(cum, u[:,0], side='right')
+    ids = np.minimum(ids, len(tri)-1)
+    weights = -np.log(np.clip(u[:,1:], 1.e-14, 1.))
+    weights /= weights.sum(axis=1,keepdims=True)
+    pts = (weights[:,0,None]*interior[None,:]
+           + np.einsum('ni,nij->nj', weights[:,1:], tri[ids]))
+    return pts
+
+
+def _face_diagnostics(vertices, faces, halfspaces, names, tolerance=1.e-5):
+    face_info=[]
+    for i,(h,name) in enumerate(zip(halfspaces,names)):
+        dist = np.abs(vertices @ h[:3]+h[3])/max(np.linalg.norm(h[:3]),1.e-12)
+        count = int(np.count_nonzero(dist < tolerance))
+        if count >= 3:
+            face_info.append({'Plano delimitante':name,'Vértices sobre plano':count,
+                              'Tipo':'Límite artificial' if name.startswith('Dominio') else 'Discontinuidad'})
+    return face_info
+
+
+def reconstruct_curved_block(block, systems, nplanes, W, H, L, az,
+                             powers=(12,14,16), repeats=4):
+    """Volumen de la celda convexa FUERA de la herradura curva, estimado con Sobol.
+    Una celda puede contener varias componentes: no garantiza correspondencia con
+    una componente voxelizada, ni continuidad o liberación cinemática.
+    """
+    sample=np.asarray(block['center'],float)
+    hs,names=cell_halfspaces(systems,nplanes,W,H,L,az,sample)
+    poly=convex_polyhedron(hs)
+    if poly['status'] != 'ok': return poly
+    vertices,faces=poly['vertices'],poly['faces']
+    estimates=[]; progress=[]
+    for power in powers:
+        vals=[]
+        for rep in range(repeats):
+            pts=_tetra_sampling(vertices,faces,poly['interior'],2**power,seed=7919+power*41+rep)
+            vals.append(float(poly['volume']*outside_horseshoe(pts,W,H).mean()))
+        progress.append({'Muestras por réplica':2**power,'Volumen medio (m³)':float(np.mean(vals)),
+                         'Desviación entre réplicas (m³)':float(np.std(vals,ddof=1)) if repeats>1 else np.nan})
+        estimates=vals
+    volume=float(np.mean(estimates))
+    sd=float(np.std(estimates,ddof=1)) if repeats>1 else float('nan')
+    return {**poly, 'status':'ok', 'volume_convex_cell':poly['volume'],
+            'volume_curved_estimate':volume,'replicate_sd':sd,
+            'relative_difference':float(volume/block['volume']-1) if block['volume'] else None,
+            'progress':progress,'faces_diagnostic':_face_diagnostics(vertices,faces,hs,names),
+            'note':'Volumen numérico de TODA la porción exterior de la celda; no necesariamente la misma componente voxelizada.'}
+
+
+def connected_curved_components(block, systems, nplanes, W, H, L, az,
+                                resolutions=(48, 72, 96), connectivity=1):
+    """Experimental grid-based connected components of rock within a plane cell.
+
+    Identifies the component containing (or nearest to) the selected voxel-block
+    centroid. This is a diagnostic, NOT an exact mesh or a validated wedge volume.
+    """
+    from scipy import ndimage as ndi
+    sample = np.asarray(block['center'], dtype=float)
+    hs, names = cell_halfspaces(systems, nplanes, W, H, L, az, sample)
+    poly = convex_polyhedron(hs)
+    if poly['status'] != 'ok':
+        return poly
+    low = poly['vertices'].min(axis=0)
+    high = poly['vertices'].max(axis=0)
+    span = high - low
+    if np.any(span <= 1e-9):
+        return {'status': 'degenerate_bounds'}
+    results = []
+    last_mask = None
+    last_origin = None
+    last_step = None
+    last_components = []
+    for resolution in resolutions:
+        # Isotropic cells; the longest box dimension has 'resolution' cells.
+        step = float(np.max(span) / int(resolution))
+        shape = np.maximum(3, np.ceil(span / step).astype(int))
+        axes = [low[i] + (np.arange(shape[i]) + .5) * step for i in range(3)]
+        xx, yy, zz = np.meshgrid(*axes, indexing='ij', sparse=True)
+        mask = np.ones(tuple(shape), dtype=bool)
+        # Evaluate each halfspace without constructing a large (N,3) point array.
+        for h in hs:
+            mask &= (h[0]*xx + h[1]*yy + h[2]*zz + h[3] <= 1e-9)
+        r = W / 2.
+        spring = max(0., H-r)
+        void = (np.abs(xx) <= r) & ((zz <= spring) | (xx*xx+(zz-spring)**2 <= r*r))
+        mask &= ~void
+        structure = ndi.generate_binary_structure(3, connectivity)
+        labels, n_components = ndi.label(mask, structure=structure)
+        counts = np.bincount(labels.ravel(), minlength=n_components+1)
+        counts[0] = 0
+        # Associate the selected voxel centroid to one connected component.
+        # If centroid falls on a grid boundary, select nearest occupied cell,
+        # but report that the association was inferred rather than exact.
+        center_index = np.rint((sample - low) / step - .5).astype(int)
+        center_index = np.clip(center_index, 0, shape-1)
+        selected_label = int(labels[tuple(center_index)])
+        association = 'centroid_inside_component'
+        distance = 0.
+        if selected_label == 0:
+            candidates = np.argwhere(labels > 0)
+            if len(candidates):
+                deltas = (candidates + .5) * step + low - sample
+                nearest = int(np.argmin(np.einsum('ij,ij->i', deltas, deltas)))
+                cell = candidates[nearest]
+                distance = float(np.linalg.norm(deltas[nearest]))
+                selected_label = int(labels[tuple(cell)])
+                association = 'nearest_component_inferred'
+            else:
+                association = 'no_rock_cells'
+        component_count = int(counts[selected_label]) if selected_label else 0
+        selected_volume = component_count * step**3
+        total_volume = int(mask.sum()) * step**3
+        components = sorted(({'label':int(i), 'volume_m3':float(counts[i]*step**3),
+                              'cell_count':int(counts[i])} for i in range(1,n_components+1)),
+                            key=lambda item: -item['volume_m3'])
+        results.append({'Resolución':int(resolution), 'Celdas X/Y/Z': '×'.join(map(str,shape)),
+                        'Componentes':int(n_components),
+                        'Volumen componente (m³)':float(selected_volume),
+                        'Volumen total (m³)':float(total_volume),
+                        'Asociación':association,
+                        'Distancia centro (m)':distance})
+        last_mask = (labels == selected_label) if selected_label else np.zeros_like(mask)
+        last_origin = low.copy()
+        last_step = step
+        last_components = components
+    return {'status':'ok', 'progress':results, 'components':last_components,
+            'selected_component_volume':results[-1]['Volumen componente (m³)'],
+            'total_volume':results[-1]['Volumen total (m³)'],
+            'association':results[-1]['Asociación'],
+            'association_distance':results[-1]['Distancia centro (m)'],
+            'component_mask':last_mask, 'grid_origin':last_origin,
+            'grid_step':last_step, 'halfspace_names':names,
+            'warning':'Discretización experimental; las componentes pueden fusionarse o desaparecer al cambiar resolución.'}
+def connected_curved_components(block, systems, nplanes, W, H, L, az,
+                                resolutions=(48, 72, 96), connectivity=1):
+    """Experimental grid-based connected components of rock within a plane cell.
+
+    Identifies the component containing (or nearest to) the selected voxel-block
+    centroid. This is a diagnostic, NOT an exact mesh or a validated wedge volume.
+    """
+    from scipy import ndimage as ndi
+    sample = np.asarray(block['center'], dtype=float)
+    hs, names = cell_halfspaces(systems, nplanes, W, H, L, az, sample)
+    poly = convex_polyhedron(hs)
+    if poly['status'] != 'ok':
+        return poly
+    low = poly['vertices'].min(axis=0)
+    high = poly['vertices'].max(axis=0)
+    span = high - low
+    if np.any(span <= 1e-9):
+        return {'status': 'degenerate_bounds'}
+    results = []
+    last_mask = None
+    last_origin = None
+    last_step = None
+    last_components = []
+    for resolution in resolutions:
+        # Isotropic cells; the longest box dimension has 'resolution' cells.
+        step = float(np.max(span) / int(resolution))
+        shape = np.maximum(3, np.ceil(span / step).astype(int))
+        axes = [low[i] + (np.arange(shape[i]) + .5) * step for i in range(3)]
+        xx, yy, zz = np.meshgrid(*axes, indexing='ij', sparse=True)
+        mask = np.ones(tuple(shape), dtype=bool)
+        # Evaluate each halfspace without constructing a large (N,3) point array.
+        for h in hs:
+            mask &= (h[0]*xx + h[1]*yy + h[2]*zz + h[3] <= 1e-9)
+        r = W / 2.
+        spring = max(0., H-r)
+        void = (np.abs(xx) <= r) & ((zz <= spring) | (xx*xx+(zz-spring)**2 <= r*r))
+        mask &= ~void
+        structure = ndi.generate_binary_structure(3, connectivity)
+        labels, n_components = ndi.label(mask, structure=structure)
+        counts = np.bincount(labels.ravel(), minlength=n_components+1)
+        counts[0] = 0
+        # Associate the selected voxel centroid to one connected component.
+        # If centroid falls on a grid boundary, select nearest occupied cell,
+        # but report that the association was inferred rather than exact.
+        center_index = np.rint((sample - low) / step - .5).astype(int)
+        center_index = np.clip(center_index, 0, shape-1)
+        selected_label = int(labels[tuple(center_index)])
+        association = 'centroid_inside_component'
+        distance = 0.
+        if selected_label == 0:
+            candidates = np.argwhere(labels > 0)
+            if len(candidates):
+                deltas = (candidates + .5) * step + low - sample
+                nearest = int(np.argmin(np.einsum('ij,ij->i', deltas, deltas)))
+                cell = candidates[nearest]
+                distance = float(np.linalg.norm(deltas[nearest]))
+                selected_label = int(labels[tuple(cell)])
+                association = 'nearest_component_inferred'
+            else:
+                association = 'no_rock_cells'
+        component_count = int(counts[selected_label]) if selected_label else 0
+        selected_volume = component_count * step**3
+        total_volume = int(mask.sum()) * step**3
+        components = sorted(({'label':int(i), 'volume_m3':float(counts[i]*step**3),
+                              'cell_count':int(counts[i])} for i in range(1,n_components+1)),
+                            key=lambda item: -item['volume_m3'])
+        results.append({'Resolución':int(resolution), 'Celdas X/Y/Z': '×'.join(map(str,shape)),
+                        'Componentes':int(n_components),
+                        'Volumen componente (m³)':float(selected_volume),
+                        'Volumen total (m³)':float(total_volume),
+                        'Asociación':association,
+                        'Distancia centro (m)':distance})
+        last_mask = (labels == selected_label) if selected_label else np.zeros_like(mask)
+        last_origin = low.copy()
+        last_step = step
+        last_components = components
+    return {'status':'ok', 'progress':results, 'components':last_components,
+            'selected_component_volume':results[-1]['Volumen componente (m³)'],
+            'total_volume':results[-1]['Volumen total (m³)'],
+            'association':results[-1]['Asociación'],
+            'association_distance':results[-1]['Distancia centro (m)'],
+            'component_mask':last_mask, 'grid_origin':last_origin,
+            'grid_step':last_step, 'halfspace_names':names,
+            'warning':'Discretización experimental; las componentes pueden fusionarse o desaparecer al cambiar resolución.'}
