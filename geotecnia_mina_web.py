@@ -5,9 +5,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_geotecnico import compute_regions, grid_diagnostic, synthetic_tests, compare_block_resolution
+from motor_geotecnico import compute_regions, grid_diagnostic, synthetic_tests, test_region_invariants, compare_block_resolution
 
-st.set_page_config(page_title='Geotecnia Mina v21 · motor único', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v22 · motor único', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Avisos: contraste legible incluso con tema oscuro */
 [data-testid="stAlert"]{border:1px solid #b5a36b!important}
@@ -521,10 +521,11 @@ with tabs[6]:
 with tabs[7]:
  st.header('⚙️ Motor geotécnico · análisis unificado')
  st.caption('La geometría visible, las tablas y la exportación utilizan las mismas etiquetas voxel. Los diagnósticos nunca sustituyen el volumen de referencia.')
- st.warning('GEOMETRÍA PRELIMINAR: los volúmenes proceden de discretización voxel. No se ha validado la persistencia finita, la liberación cinemática ni el factor de seguridad. No usar para dimensionamiento.')
+ st.warning('GEOMETRÍA PRELIMINAR: la conectividad se calcula por firmas de planos; el volumen se estima por submuestreo 2×2×2 de cada voxel. Las etiquetas y superficies 3D siguen discretizadas. Sin persistencia finita, liberación cinemática ni FS. No usar para dimensionamiento.')
+ st.caption(f"Firma de discontinuidades de B{selected['id']}: {selected.get('signature', '—')} · Volumen voxel bruto: {selected.get('voxel_volume', selected['volume']):.4f} m³")
  st.subheader(f"Región seleccionada: B{selected['id']} · {selected['zone']}")
  a,b,c,d=st.columns(4)
- a.metric('Volumen de referencia (voxel)',f"{selected['volume']:.4f} m³")
+ a.metric('Volumen estimado (subvoxel)',f"{selected['volume']:.4f} m³")
  b.metric('Peso estimado',f"{selected['volume']*gamma:.2f} kN")
  c.metric('Condición de dominio','Abierta' if selected['open'] else 'Cerrada')
  d.metric('FS validado','No calculado')
@@ -588,6 +589,7 @@ with tabs[7]:
  if st.button('Ejecutar pruebas geométricas básicas',key='unico_tests'):
   try:
    synthetic_tests()
-   st.success('Pruebas básicas superadas.')
+   result_test=test_region_invariants()
+   st.success(f"Pruebas de conectividad y exclusividad superadas: {result_test['blocks']} regiones de prueba.")
   except AssertionError:
    st.error('Una o más pruebas geométricas han fallado.')
