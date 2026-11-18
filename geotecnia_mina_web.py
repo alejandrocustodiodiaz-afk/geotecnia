@@ -6,7 +6,7 @@ import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
 
-st.set_page_config(page_title='Geotecnia Mina v16.4', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v16.5', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
 html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
@@ -29,7 +29,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v16.4')
+st.title('⛏️ GEOTECNIA MINA  ·  v16.5')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -235,6 +235,8 @@ with tabs[0]:
  with c3:
   scale=st.slider('Escala de análisis de cuña',.5,2.,1.,.05)
   focus=st.checkbox('Acercar cámara a la cuña',False)
+  isolate=st.checkbox('Aislar cuña seleccionada (ocultar galería y otras regiones)',False)
+  identify=st.checkbox('Identificar bloques con etiquetas B',True)
   quality=st.slider('Calidad de superficie 3D',55,115,85,10)
  st.markdown('#### 👁️ Herramientas de visualización 3D')
  with st.expander('Mostrar / ocultar elementos, etiquetas y cámara',expanded=True):
@@ -252,6 +254,7 @@ with tabs[0]:
    view_labels=st.checkbox('Títulos de ejes',True,key='view_labels')
    label_size=st.slider('Tamaño de números',12,24,17,1,key='label_size')
   camera_view=st.selectbox('Vista de cámara',['Isométrica','Frontal','Lateral','Superior','Centrar cuña'],key='camera_view')
+  st.caption('Para examinar B15/B16: selecciona el bloque, activa Aislar y escoge Centrar cuña. Puedes ocultar ejes y números.')
   if st.button('Restablecer visualización',key='reset_view'):
    for k,v in {'view_tunnel':True,'view_wedge':True,'view_bolts':True,'view_cables':True,'view_axes':True,'view_grid':False,'view_labels':True,'label_size':17,'camera_view':'Isométrica'}.items():st.session_state[k]=v
    st.rerun()
@@ -264,12 +267,12 @@ with tabs[0]:
  d.metric('Peso escalado',f"{selected['volume']*gamma*scale**3:.1f} kN")
  fig=go.Figure();ymin=max(0,selected['contact'][1]-2.5) if focus else 0;ymax=min(L,selected['contact'][1]+2.5) if focus else L
  tv,tf=tunnel_surface(section,ymin,ymax)
- if view_tunnel:fig.add_trace(go.Mesh3d(x=tv[:,0],y=tv[:,1],z=tv[:,2],i=tf[:,0],j=tf[:,1],k=tf[:,2],color='#81b8e6',opacity=.16,flatshading=True,hoverinfo='skip',name='Galería'))
- if view_tunnel:
+ if view_tunnel and not isolate:fig.add_trace(go.Mesh3d(x=tv[:,0],y=tv[:,1],z=tv[:,2],i=tf[:,0],j=tf[:,1],k=tf[:,2],color='#81b8e6',opacity=.16,flatshading=True,hoverinfo='skip',name='Galería'))
+ if view_tunnel and not isolate:
   for y in [ymin,ymax]:fig.add_trace(go.Scatter3d(x=section[:,0],y=np.full(len(section),y),z=section[:,1],mode='lines',line=dict(color='#a2b6ca',width=5),showlegend=False,hoverinfo='skip'))
- if view_tunnel:
+ if view_tunnel and not isolate:
   for x,z in section[::8]:fig.add_trace(go.Scatter3d(x=[x,x],y=[ymin,ymax],z=[z,z],mode='lines',line=dict(color='#9cc7ed',width=3),showlegend=False,hoverinfo='skip'))
- shown=([selected] if mode=='Solo seleccionada' else ([v for v in visible if not v['open']] if mode=='Todas las cerradas' else visible)) if view_wedge else []
+ shown=([selected] if isolate else ([selected] if mode=='Solo seleccionada' else ([v for v in visible if not v['open']] if mode=='Todas las cerradas' else visible))) if view_wedge else []
  shown=sorted(shown,key=lambda b:(b['id']!=selected['id'],-b['volume']))[:35]
  st.caption(f'**Visualización 3D:** {len(shown)} de {len(visible) if mode=="Todas las regiones" else len(closed) if mode=="Todas las cerradas" else 1} regiones del filtro. Verde = seleccionada; otros colores = regiones adicionales. Máximo 35 para mantener fluidez.')
  for j,v in enumerate(shown):
@@ -280,6 +283,13 @@ with tabs[0]:
   if v['id']==selected['id'] and scale!=1:verts=(verts-np.array(v['center']))*scale+np.array(v['center'])
   color='#34e3a4' if v['id']==selected['id'] else {'Bóveda':'#f6bb54','Hastial izq.':'#63b3ed','Hastial der.':'#e99ed8'}.get(v['zone'],COL[j%len(COL)])
   fig.add_trace(go.Mesh3d(x=verts[:,0],y=verts[:,1],z=verts[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color=color,opacity=.86 if v['id']==selected['id'] else (.24 if v['open'] else .58),name=f"B{v['id']}",flatshading=True,lighting=dict(ambient=.55,diffuse=.85,specular=.35,roughness=.35,fresnel=.1),hovertemplate=f"B{v['id']} · {v['zone']}<br>{v['volume']:.2f} m³<br>{'Abierta al borde' if v['open'] else 'Cerrada en dominio'}<extra></extra>"))
+  if identify:
+   # Marcador situado en el centro de la región, con texto independiente del hover.
+   center=np.asarray(v['center'])
+   fig.add_trace(go.Scatter3d(x=[center[0]],y=[center[1]],z=[center[2]],mode='markers+text',
+     marker=dict(size=5,color='#ffffff',line=dict(color='#101d2f',width=1)),
+     text=[f"B{v['id']}"],textposition='top center',textfont=dict(size=15,color='#ffffff'),
+     showlegend=False,hoverinfo='skip'))
  def bolts():
   # Anclajes radiales simplificados: puntos en bóveda y hastiales, con estaciones longitudinales.
   arc=np.linspace(np.pi-.12,.12,max(5,round(np.pi*r/boltspace)+1))
@@ -300,7 +310,7 @@ with tabs[0]:
   if not inside.any():return False,0.
   last=np.flatnonzero(inside)[-1];return True,float(np.linalg.norm(q-p)*(1-t[last]))
  hits=[]
- if view_bolts or view_cables:
+ if (view_bolts or view_cables) and not isolate:
   for p,out,length,kind in bolts():
    if (kind=='Perno' and not view_bolts) or (kind=='Cable' and not view_cables):continue
    q=p+out*length
@@ -308,21 +318,21 @@ with tabs[0]:
    hit,tail=intersection(p,q,selected['id']);hits.append((kind,hit,tail))
    fig.add_trace(go.Scatter3d(x=[p[0],q[0]],y=[p[1],q[1]],z=[p[2],q[2]],mode='lines',line=dict(color=('#e8a34d' if hit else '#4c789e') if kind=='Perno' else '#c68bf0',width=5 if hit else 2),showlegend=False,hoverinfo='skip'))
  # Encuadre local de la región, evitando el gran vacío del visor anterior.
- cx,cy,cz=selected['contact'];span=max(W*.95,H*.95,4.8) if focus else max(W,H,L)
- xr=[cx-span*.65,cx+span*.65] if focus else [xs[0],xs[-1]]
- yr=[max(0,cy-span*.7),min(L,cy+span*.7)] if focus else [0,L]
- zr=[max(0,cz-span*.65),min(zs[-1],cz+span*.65)] if focus else [0,zs[-1]]
+ cx,cy,cz=selected['center'] if (focus or isolate or camera_view=='Centrar cuña') else selected['contact'];span=max(W*.7,H*.7,3.0) if (focus or isolate or camera_view=='Centrar cuña') else max(W,H,L)
+ xr=[cx-span*.65,cx+span*.65] if (focus or isolate or camera_view=='Centrar cuña') else [xs[0],xs[-1]]
+ yr=[max(0,cy-span*.7),min(L,cy+span*.7)] if (focus or isolate or camera_view=='Centrar cuña') else [0,L]
+ zr=[max(0,cz-span*.65),min(zs[-1],cz+span*.65)] if (focus or isolate or camera_view=='Centrar cuña') else [0,zs[-1]]
  # Plotly: texto grande y blanco, cuadrícula opcional y cámara configurable.
- cameras={'Isométrica':dict(x=1.4,y=-1.7,z=1.15),'Frontal':dict(x=0,y=-2.5,z=.35),
+ cameras={'Isométrica':dict(x=1.4,y=-1.7,z=1.15),'Frontal':dict(x=0,y=-2.5,z=.55),
           'Lateral':dict(x=2.5,y=0,z=.35),'Superior':dict(x=.01,y=-.01,z=2.8),
-          'Centrar cuña':dict(x=1.0,y=-1.2,z=.85)}
+          'Centrar cuña':dict(x=1.35,y=-1.6,z=1.05)}
  def axis_style(title,rng):
   return dict(title=dict(text=title if view_labels else '',font=dict(size=label_size+1,color='#ffffff')),
               range=rng,visible=view_axes,showticklabels=view_axes,
               tickfont=dict(size=label_size,color='#ffffff'),tickcolor='#ffffff',
               showgrid=view_grid,gridcolor='#50647e',gridwidth=1,
               showbackground=False,zeroline=False,ticks='outside',ticklen=5,
-              nticks=5)
+              nticks=4)
  fig.update_layout(height=780,margin=dict(l=0,r=0,t=0,b=0),paper_bgcolor='#0b1421',
      font=dict(color='#ffffff',size=label_size),
      scene=dict(domain=dict(x=[0,1],y=[0,1]),bgcolor='#0b1421',
@@ -333,8 +343,24 @@ with tabs[0]:
                     projection=dict(type='orthographic'))),showlegend=False)
 
  st.plotly_chart(fig,use_container_width=True)
+ # Diagnóstico explícito de bordes: basado en los mismos vóxeles que la clasificación.
+ mask=(labels==selected['id'])
+ borders=[]
+ for touched,label in [(mask[0,:,:].any(),'X mínimo'),(mask[-1,:,:].any(),'X máximo'),
+                       (mask[:,0,:].any(),'Y inicial'),(mask[:,-1,:].any(),'Y final'),
+                       (mask[:,:,0].any(),'Z inferior'),(mask[:,:,-1].any(),'Z superior')]:
+  if touched:borders.append(label)
+ idx=np.argwhere(mask)
+ if len(idx):
+  mins=np.array([xs[idx[:,0].min()],ys[idx[:,1].min()],zs[idx[:,2].min()]])
+  maxs=np.array([xs[idx[:,0].max()],ys[idx[:,1].max()],zs[idx[:,2].max()]])
+  extents=maxs-mins
+  st.markdown(f"**Diagnóstico B{selected['id']}:** {'Abierta al dominio' if borders else 'Cerrada en dominio'} · ",unsafe_allow_html=False)
+  st.write('Bordes alcanzados:', ', '.join(borders) if borders else 'Ninguno de los seis límites del dominio discretizado')
+  st.write(f'Dimensiones aproximadas de su caja envolvente (X × Y × Z): **{extents[0]:.2f} × {extents[1]:.2f} × {extents[2]:.2f} m**. Son extensiones voxelizadas, no dimensiones verificadas de una cuña.')
+  if mode=='Todas las cerradas' and len(closed)>1:
+   st.caption('Si solo distingues una cuña, utiliza «Aislar cuña seleccionada» y alterna entre B15 y B16: pueden solaparse en proyección o una puede quedar oculta.')
  st.caption('Galería azul semitransparente, región seleccionada verde; otras regiones en amarillo (bóveda), azul (hastial izquierdo) o rosa (derecho).')
- st.caption('Galería azul semitransparente, región seleccionada verde; zoom y rotación con el ratón. Las dimensiones y el encuadre pueden ajustarse con los controles.')
  st.caption('Superficie 3D reconstruida mediante ecuaciones de planos y sección de herradura para regiones cerradas; identificación del bloque aún basada en vóxeles. Las caras y volúmenes necesitan verificación geométrica independiente.')
  st.info('La clasificación abierta/cerrada se refiere exclusivamente a los límites del dominio discretizado. No se ha comprobado la liberación cinemática ni la estabilidad.')
  if view_bolts or view_cables:
