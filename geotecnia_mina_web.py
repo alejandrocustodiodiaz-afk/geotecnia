@@ -5,10 +5,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_v18 import grid_diagnostic, synthetic_tests
-from motor_geometrico_v17_4 import reconstruct_curved_block, connected_curved_components, compare_spatial_components, reconstruct_labeled_block, diagnose_independent_block
+from motor_geotecnico import (compute_regions, grid_diagnostic, synthetic_tests, reconstruct_curved_block, connected_curved_components, compare_spatial_components, reconstruct_labeled_block, diagnose_independent_block)
 
-st.set_page_config(page_title='Geotecnia Mina v18 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v19 · motor único', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Avisos: contraste legible incluso con tema oscuro */
 [data-testid="stAlert"]{border:1px solid #b5a36b!important}
@@ -38,7 +37,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v18 experimental')
+st.title('⛏️ GEOTECNIA MINA  ·  v19 · motor único')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -144,34 +143,7 @@ with st.expander('📐 Familias de discontinuidades · editar orientación y pos
 
 @st.cache_data(show_spinner=False,max_entries=3)
 def compute(W,H,L,az,res,nplanes,systems_json):
- systems=json.loads(systems_json);r=W/2;ss=max(0,H-r);margin=max(2.,W*.5)
- nx=res;ny=max(30,min(105,round(res*L/(W+2*margin))));nz=max(35,min(85,round(res*(H+margin)/(W+2*margin))))
- xs=np.linspace(-r-margin,r+margin,nx);ys=np.linspace(0,L,ny);zs=np.linspace(0,H+margin,nz)
- X,Y,Z=np.meshgrid(xs,ys,zs,indexing='ij');tunnel=(abs(X)<=r)&((Z<=ss)|((Z>ss)&(X*X+(Z-ss)**2<=r*r)))
- rock=~tunnel;signature=np.zeros(rock.shape,dtype=np.uint32);bit=0
- for s in systems:
-  n=normal((s['dd']-az)%360,s['dip']);base=np.dot(n,[s['xx'],s['yy'],H]);signed=n[0]*X+n[1]*Y+n[2]*Z-base
-  for k in range(nplanes):
-   offset=(k-(nplanes-1)/2)*s['spacing'];signature|=((signed>=offset).astype(np.uint32)<<bit);bit+=1
- structure=ndi.generate_binary_structure(3,1);adjacent=rock&ndi.binary_dilation(tunnel,structure=structure)
- labels=np.zeros(rock.shape,dtype=np.int16);blocks=[];ident=0
- voxel=np.prod([xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0]])
- for sig in np.unique(signature[adjacent]):
-  region_labels,_=ndi.label(rock&(signature==sig),structure)
-  for comp in np.unique(region_labels[adjacent]):
-   if comp==0:continue
-   reg=region_labels==comp;count=int(reg.sum())
-   if count<5:continue
-   touching=reg&adjacent;roof=int((touching&(Z>ss)).sum());left=int((touching&(Z<=ss)&(X<0)).sum());right=int((touching&(Z<=ss)&(X>=0)).sum())
-   zone=['Bóveda','Hastial izq.','Hastial der.'][np.argmax([roof,left,right])]
-   opened=bool(reg[0].any() or reg[-1].any() or reg[:,0].any() or reg[:,-1].any() or reg[:,:,0].any() or reg[:,:,-1].any())
-   ident+=1;labels[reg]=ident
-   coords=np.argwhere(reg);cc=np.argwhere(touching)
-   c=np.mean(coords,axis=0);tc=np.mean(cc,axis=0)
-   center=[float(xs[0]+c[0]*(xs[1]-xs[0])),float(ys[0]+c[1]*(ys[1]-ys[0])),float(zs[0]+c[2]*(zs[1]-zs[0]))]
-   contact=[float(xs[0]+tc[0]*(xs[1]-xs[0])),float(ys[0]+tc[1]*(ys[1]-ys[0])),float(zs[0]+tc[2]*(zs[1]-zs[0]))]
-   blocks.append(dict(id=ident,zone=zone,volume=count*voxel,open=opened,center=center,contact=contact))
- return xs,ys,zs,labels,blocks
+ return compute_regions(W,H,L,az,res,nplanes,systems_json)
 
 @st.cache_data(show_spinner=False,max_entries=50)
 def surface(labels,ident,dx,dy,dz,x0,y0,z0):
