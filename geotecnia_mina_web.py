@@ -570,7 +570,7 @@ with tabs[7]:
    st.caption('Visualización voxelizada: comparación de la misma etiqueta, sin fusionarla con B15/B16 u otras regiones.')
  st.divider()
  st.subheader('Auditoría de resolución e identidad del bloque')
- st.caption('Compara el bloque seleccionado entre dos discretizaciones nuevas mediante correspondencia espacial, sin suponer que los identificadores B sean constantes.')
+ st.caption('Solo compara regiones con la misma firma de discontinuidades, cobertura y pureza suficientes y correspondencia recíproca entre mallas. Si falla, no se asigna volumen.')
  if st.button('Comparar resoluciones 48 y 72',key='v21_resolution_go'):
   with st.spinner('Calculando las regiones y sus correspondencias en dos resoluciones...'):
    try:
@@ -580,9 +580,9 @@ with tabs[7]:
      if audit['volume_change_pct'] is not None:
       st.metric('Variación entre resoluciones',f"{audit['volume_change_pct']:.1f} %")
      if audit['ambiguous']:
-      st.error('Correspondencia ambigua: hay pérdida de cobertura, mezcla o división entre etiquetas. No se valida el volumen.')
+      st.error('Sin correspondencia válida entre resoluciones. Se omiten los volúmenes comparativos y su variación; no se valida el bloque.')
      else:
-      st.info('Correspondencia espacial favorable, pero todavía no constituye validación geométrica ni cinemática.')
+      st.info('Correspondencia recíproca provisional. No constituye validación geométrica, de persistencia ni cinemática.')
     else:st.warning('No se pudo completar la auditoría: '+audit['status'])
    except Exception as exc:st.error(f'Error de auditoría: {type(exc).__name__}: {exc}')
  st.divider()
