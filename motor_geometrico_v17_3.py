@@ -296,3 +296,70 @@ def connected_curved_components(block, systems, nplanes, W, H, L, az,
             'component_mask':last_mask, 'grid_origin':last_origin,
             'grid_step':last_step, 'halfspace_names':names,
             'warning':'Discretización experimental; las componentes pueden fusionarse o desaparecer al cambiar resolución.'}
+
+
+
+def compare_spatial_components(block, blocks, original_labels, xs, ys, zs,
+                               systems, nplanes, W, H, L, az,
+                               resolutions=(48, 72, 96)):
+    """Compare reconstructed connected components to original voxel labels.
+
+    Nearest-neighbour resampling is a diagnostic, not geometric validation.
+    Returns overlap table and flags ambiguous many-to-one assignments.
+    """
+    from scipy import ndimage as ndi
+    result = connected_curved_components(block, systems, nplanes, W, H, L, az,
+                                         resolutions=resolutions)
+    if result.get('status') != 'ok':
+        return result
+    hs, _ = cell_halfspaces(systems, nplanes, W, H, L, az, block['center'])
+    poly = convex_polyhedron(hs)
+    low = poly['vertices'].min(axis=0)
+    high = poly['vertices'].max(axis=0)
+    step = float(np.max(high-low) / int(resolutions[-1]))
+    shape = np.maximum(3, np.ceil((high-low)/step).astype(int))
+    ax = [low[i]+(np.arange(shape[i])+.5)*step for i in range(3)]
+    xx, yy, zz = np.meshgrid(*ax, indexing='ij', sparse=True)
+    mask = np.ones(tuple(shape), dtype=bool)
+    for h in hs:
+        mask &= (h[0]*xx+h[1]*yy+h[2]*zz+h[3] <= 1e-9)
+    r=W/2.; spring=max(0.,H-r)
+    mask &= ~((np.abs(xx)<=r) & ((zz<=spring) | (xx*xx+(zz-spring)**2<=r*r)))
+    components, n = ndi.label(mask, ndi.generate_binary_structure(3,1))
+    # Original voxel labels at the reconstructed cell centres. Out-of-domain = 0.
+    original_axes=[np.asarray(a) for a in (xs,ys,zs)]
+    indices=[]; valid=[]
+    for a,src in zip(ax,original_axes):
+        di=float(src[1]-src[0]); f=(a-src[0])/di
+        indices.append(np.clip(np.rint(f).astype(int),0,len(src)-1))
+        valid.append((f>=-.5)&(f<=len(src)-.5))
+    old=original_labels[np.ix_(*indices)].copy()
+    old[~(valid[0][:,None,None]&valid[1][None,:,None]&valid[2][None,None,:])]=0
+    old[~mask]=0
+    relevant=np.unique(old[old>0]); rows=[]
+    counts=np.bincount(components.ravel(),minlength=n+1)
+    for bid in relevant:
+        sub=(old==bid)
+        overlaps=np.bincount(components[sub],minlength=n+1)
+        overlaps[0]=0
+        cid=int(np.argmax(overlaps))
+        overlap=int(overlaps[cid])
+        original_count=int(sub.sum())
+        component_count=int(counts[cid]) if cid else 0
+        rows.append({'Bloque':f'B{bid}', 'Componente':cid,
+                     'Intersección (m³)':overlap*step**3,
+                     'Volumen original remuestreado (m³)':original_count*step**3,
+                     'Volumen componente (m³)':component_count*step**3,
+                     'Cobertura del bloque (%)':100*overlap/max(original_count,1),
+                     'Pureza de componente (%)':100*overlap/max(component_count,1),
+                     'Celdas coincidentes':overlap})
+    # Blocks outside the sampled cell are not compared; do not infer their absence.
+    mapping={row['Bloque']:row['Componente'] for row in rows if row['Componente']}
+    selected_key=f"B{block['id']}"
+    selected_row=next((row for row in rows if row['Bloque']==selected_key),None)
+    collisions=[key for key,cid in mapping.items()
+                if selected_row and cid==selected_row['Componente'] and key!=selected_key]
+    result.update({'overlap_table':rows,'selected_overlap':selected_row,
+                   'collisions':collisions,'compared_block_count':len(relevant),
+                   'mapping_validated':False})
+    return result
