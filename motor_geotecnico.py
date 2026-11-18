@@ -553,86 +553,112 @@ def synthetic_tests():
     assert rock_mask(0.,6.,5.8,5.8)
     return True
 
-def compute_regions(W,H,L,az,res,nplanes,systems_json):
- systems=json.loads(systems_json);r=W/2;ss=max(0,H-r);margin=max(2.,W*.5)
- nx=res;ny=max(30,min(105,round(res*L/(W+2*margin))));nz=max(35,min(85,round(res*(H+margin)/(W+2*margin))))
- xs=np.linspace(-r-margin,r+margin,nx);ys=np.linspace(0,L,ny);zs=np.linspace(0,H+margin,nz)
- X,Y,Z=np.meshgrid(xs,ys,zs,indexing='ij');tunnel=(abs(X)<=r)&((Z<=ss)|((Z>ss)&(X*X+(Z-ss)**2<=r*r)))
- rock=~tunnel;signature=np.zeros(rock.shape,dtype=np.uint32);bit=0
- for s in systems:
-  n=normal(s['dd'],s['dip'],az);base=np.dot(n,[s['xx'],s['yy'],H]);signed=n[0]*X+n[1]*Y+n[2]*Z-base
-  for k in range(nplanes):
-   offset=(k-(nplanes-1)/2)*s['spacing'];signature|=((signed>=offset).astype(np.uint32)<<bit);bit+=1
- structure=ndi.generate_binary_structure(3,1);adjacent=rock&ndi.binary_dilation(tunnel,structure=structure)
- labels=np.zeros(rock.shape,dtype=np.int16);blocks=[];ident=0
- voxel=np.prod([xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0]])
- for sig in np.unique(signature[adjacent]):
-  region_labels,_=ndi.label(rock&(signature==sig),structure)
-  for comp in np.unique(region_labels[adjacent]):
-   if comp==0:continue
-   reg=region_labels==comp;count=int(reg.sum())
-   if count<5:continue
-   touching=reg&adjacent;roof=int((touching&(Z>ss)).sum());left=int((touching&(Z<=ss)&(X<0)).sum());right=int((touching&(Z<=ss)&(X>=0)).sum())
-   zone=['Bóveda','Hastial izq.','Hastial der.'][np.argmax([roof,left,right])]
-   opened=bool(reg[0].any() or reg[-1].any() or reg[:,0].any() or reg[:,-1].any() or reg[:,:,0].any() or reg[:,:,-1].any())
-   ident+=1;labels[reg]=ident
-   coords=np.argwhere(reg);cc=np.argwhere(touching)
-   c=np.mean(coords,axis=0);tc=np.mean(cc,axis=0)
-   center=[float(xs[0]+c[0]*(xs[1]-xs[0])),float(ys[0]+c[1]*(ys[1]-ys[0])),float(zs[0]+c[2]*(zs[1]-zs[0]))]
-   contact=[float(xs[0]+tc[0]*(xs[1]-xs[0])),float(ys[0]+tc[1]*(ys[1]-ys[0])),float(zs[0]+tc[2]*(zs[1]-zs[0]))]
-   blocks.append(dict(id=ident,zone=zone,volume=count*voxel,open=opened,center=center,contact=contact))
- return xs,ys,zs,labels,blocks
+def compute_regions(W, H, L, az, res, nplanes, systems_json):
+    """Motor único: celdas de semiespacios + componentes conexas 6-vecinos.
 
-
-def compare_block_resolution(block, xs, ys, zs, labels, W, H, L, az,
-                             nplanes, systems_json, resolutions=(48, 72)):
-    """Cross-resolution overlap audit; IDs are NOT assumed stable between grids.
-
-    Compare the original block on its original voxel centres to the nearest
-    labelled cell of a freshly computed grid. Report splitting and merging.
-    This is a discretization diagnostic, not an exact volume validation.
+    Los IDs B son locales a la resolución. Los volúmenes se estiman mediante
+    integración subvoxel 2x2x2 condicionada a la firma de cada celda. La
+    persistencia es infinita; no hay liberación cinemática ni FS.
     """
-    source = np.argwhere(labels == int(block['id']))
-    if len(source) == 0:
-        return {'status': 'missing'}
-    # Deterministic evenly spaced sampling prevents excessive memory use.
-    if len(source) > 20000:
-        source = source[np.linspace(0, len(source)-1, 20000, dtype=int)]
-    points = np.column_stack((xs[source[:, 0]], ys[source[:, 1]], zs[source[:, 2]]))
-    history = []
-    for resolution in resolutions:
-        ax, ay, azz, newlabels, newblocks = compute_regions(
-            W, H, L, az, int(resolution), nplanes, systems_json)
-        ii = np.clip(np.rint((points[:, 0]-ax[0])/(ax[1]-ax[0])).astype(int), 0, len(ax)-1)
-        jj = np.clip(np.rint((points[:, 1]-ay[0])/(ay[1]-ay[0])).astype(int), 0, len(ay)-1)
-        kk = np.clip(np.rint((points[:, 2]-azz[0])/(azz[1]-azz[0])).astype(int), 0, len(azz)-1)
-        values, counts = np.unique(newlabels[ii, jj, kk], return_counts=True)
-        matches = sorted(((int(v), int(c)) for v, c in zip(values, counts) if v > 0),
-                         key=lambda x: -x[1])
-        if not matches:
-            history.append({'Resolución': int(resolution), 'Bloque equivalente': 'No encontrado',
-                            'Volumen (m³)': None, 'Cobertura (%)': 0.,
-                            'Otros bloques coincidentes': 0, 'Pureza inversa (%)': None})
-            continue
-        bid, matched = matches[0]
-        other = sum(1 for _, count in matches[1:] if count >= max(2, int(.01*len(points))))
-        candidate = next(b for b in newblocks if b['id'] == bid)
-        # Check how much of the new candidate belongs to original source block.
-        candidate_points = np.argwhere(newlabels == bid)
-        if len(candidate_points) > 20000:
-            candidate_points = candidate_points[np.linspace(0, len(candidate_points)-1, 20000, dtype=int)]
-        orig_i = np.clip(np.rint((ax[candidate_points[:, 0]]-xs[0])/(xs[1]-xs[0])).astype(int), 0, len(xs)-1)
-        orig_j = np.clip(np.rint((ay[candidate_points[:, 1]]-ys[0])/(ys[1]-ys[0])).astype(int), 0, len(ys)-1)
-        orig_k = np.clip(np.rint((azz[candidate_points[:, 2]]-zs[0])/(zs[1]-zs[0])).astype(int), 0, len(zs)-1)
-        purity = 100*float(np.mean(labels[orig_i, orig_j, orig_k] == int(block['id'])))
-        history.append({'Resolución': int(resolution), 'Bloque equivalente': f'B{bid}',
-                        'Volumen (m³)': float(candidate['volume']),
-                        'Cobertura (%)': 100*matched/len(points),
-                        'Otros bloques coincidentes': other, 'Pureza inversa (%)': purity})
-    volumes = [row['Volumen (m³)'] for row in history if row['Volumen (m³)'] is not None]
-    delta = 100*abs(volumes[-1]-volumes[-2])/max(volumes[-1], 1e-12) if len(volumes) > 1 else None
-    ambiguous = any(row['Cobertura (%)'] < 90 or row['Otros bloques coincidentes'] > 0
-                    or row['Pureza inversa (%)'] is None or row['Pureza inversa (%)'] < 90
-                    for row in history)
-    return {'status': 'ok', 'history': history, 'volume_change_pct': delta,
-            'ambiguous': ambiguous, 'validated': False}
+    systems = json.loads(systems_json)
+    r = W / 2.0
+    spring = max(0.0, H-r)
+    margin = max(2.0, W*0.5)
+    nx = int(res)
+    ny = max(30, min(105, round(res*L/(W+2*margin))))
+    nz = max(35, min(85, round(res*(H+margin)/(W+2*margin))))
+    xs = np.linspace(-r-margin, r+margin, nx)
+    ys = np.linspace(0, L, ny)
+    zs = np.linspace(0, H+margin, nz)
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij', sparse=True)
+    planes_list = planes(systems, nplanes, H, az)
+    if len(planes_list) > 30:
+        raise ValueError('Se admiten como máximo 30 planos en el motor de firmas')
+    signature = np.zeros((nx, ny, nz), dtype=np.uint32)
+    for bit, (_, n, d) in enumerate(planes_list):
+        signature |= ((n[0]*X+n[1]*Y+n[2]*Z >= d).astype(np.uint32) << bit)
+    rock = np.broadcast_to(rock_mask(X, Z, W, H), signature.shape).copy()
+    structure = ndi.generate_binary_structure(3, 1)
+    tunnel = ~rock
+    adjacent = rock & ndi.binary_dilation(tunnel, structure=structure)
+    labels = np.zeros(signature.shape, dtype=np.int16)
+    blocks = []
+    dx, dy, dz = (float(a[1]-a[0]) for a in (xs, ys, zs))
+    cell_volume = dx*dy*dz
+    ident = 0
+    # Cada firma define una celda de discontinuidades. La conectividad se
+    # comprueba DENTRO de esa firma, nunca mediante proximidad de centroides.
+    for sig in np.unique(signature[adjacent]):
+        component_labels, _ = ndi.label(rock & (signature == sig), structure)
+        for component in np.unique(component_labels[adjacent]):
+            if component == 0:
+                continue
+            reg = component_labels == component
+            count = int(reg.sum())
+            if count < 5:
+                continue
+            touching = reg & adjacent
+            roof = int((touching & (Z > spring)).sum())
+            left = int((touching & (Z <= spring) & (X < 0)).sum())
+            right = int((touching & (Z <= spring) & (X >= 0)).sum())
+            zone = ['Bóveda', 'Hastial izq.', 'Hastial der.'][int(np.argmax([roof,left,right]))]
+            opened = bool(reg[0].any() or reg[-1].any() or reg[:,0].any()
+                          or reg[:,-1].any() or reg[:,:,0].any() or reg[:,:,-1].any())
+            ident += 1
+            if ident > np.iinfo(labels.dtype).max:
+                raise ValueError('Demasiadas regiones para etiquetas int16')
+            labels[reg] = ident
+            coords = np.argwhere(reg)
+            cc = np.argwhere(touching)
+            center = [float(xs[0]+coords[:,0].mean()*dx),
+                      float(ys[0]+coords[:,1].mean()*dy),
+                      float(zs[0]+coords[:,2].mean()*dz)]
+            contact = [float(xs[0]+cc[:,0].mean()*dx),
+                       float(ys[0]+cc[:,1].mean()*dy),
+                       float(zs[0]+cc[:,2].mean()*dz)]
+            # Submuestreo de la celda de planos en los 8 octantes de cada
+            # voxel asignado; la malla de etiquetas NO se altera.
+            # Se procesa por lotes para limitar memoria.
+            weighted = 0.0
+            for batch_start in range(0, len(coords), 120000):
+                c = coords[batch_start:batch_start+120000]
+                x0, y0, z0 = xs[c[:,0]], ys[c[:,1]], zs[c[:,2]]
+                for sx in (-0.25, 0.25):
+                    for sy in (-0.25, 0.25):
+                        for sz in (-0.25, 0.25):
+                            x, y, z = x0+sx*dx, y0+sy*dy, z0+sz*dz
+                            keep = rock_mask(x, z, W, H)
+                            for bit, (_, n, d) in enumerate(planes_list):
+                                expected = bool(int(sig) & (1 << bit))
+                                if expected:
+                                    keep &= (n[0]*x+n[1]*y+n[2]*z >= d)
+                                else:
+                                    keep &= (n[0]*x+n[1]*y+n[2]*z < d)
+                            weighted += int(np.count_nonzero(keep))/8.0
+            estimated = weighted*cell_volume
+            blocks.append(dict(id=ident, zone=zone, volume=estimated,
+                               voxel_volume=count*cell_volume,
+                               open=opened, center=center, contact=contact,
+                               signature=int(sig), method='subvoxel_2x2x2',
+                               sample_count=count))
+    return xs, ys, zs, labels, blocks
+
+
+def test_region_invariants():
+    """Pruebas deterministas de exclusividad, conectividad y firmas."""
+    import json as _json
+    fam = [dict(dd=d, dip=60., xx=0., yy=y, spacing=2., persistence=5., phi=30.)
+           for d, y in ((30., 6.), (150., 7.), (270., 8.))]
+    xs, ys, zs, labels, blocks = compute_regions(5.8,5.8,15.,0.,36,2,_json.dumps(fam))
+    assert len(blocks) > 0
+    assert len({b['id'] for b in blocks}) == len(blocks)
+    assert np.all(labels >= 0)
+    structure = ndi.generate_binary_structure(3, 1)
+    pl = planes(fam,2,5.8,0.)
+    for b in blocks:
+        mask = labels == b['id']
+        assert mask.any()
+        assert ndi.label(mask,structure)[1] == 1
+        assert 0 <= b['volume'] <= b['voxel_volume'] + 1e-8
+        assert b['signature'] == sum(bit << i for i, bit in enumerate(signature_at(np.array(b['center']),pl)))
+    return {'blocks':len(blocks), 'connected':True, 'exclusive':True}
