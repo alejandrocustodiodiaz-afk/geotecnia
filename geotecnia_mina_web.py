@@ -5,9 +5,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_geotecnico import compute_regions, grid_diagnostic, synthetic_tests
+from motor_geotecnico import compute_regions, grid_diagnostic, synthetic_tests, compare_block_resolution
 
-st.set_page_config(page_title='Geotecnia Mina v19 · motor único', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v21 · motor único', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Avisos: contraste legible incluso con tema oscuro */
 [data-testid="stAlert"]{border:1px solid #b5a36b!important}
@@ -37,9 +37,9 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v19 · motor único')
+st.title('⛏️ GEOTECNIA MINA  ·  v21 · motor único')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
-st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
+st.warning('PROTOTIPO GEOMÉTRICO. Las regiones y sus superficies 3D se obtienen de la misma segmentación voxel, sin reconstrucciones visuales contradictorias. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
 # Carga de escenarios: antes de crear widgets para que sus valores se restauren.
 with st.expander('📁 Proyectos · guardar o recuperar escenario', expanded=False):
@@ -512,15 +512,15 @@ with tabs[5]:
  st.info('No se reproduce el FS simplificado de GeologgIA: la estabilidad requiere comprobar cinemática, fuerzas y sostenimiento efectivo.')
 
 with tabs[6]:
- data={'version':'20.0 motor unificado (experimental)','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
- st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v20.json','application/json')
- st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v20.csv','text/csv')
+ data={'version':'21.0 motor único (experimental)','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
+ st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v21.json','application/json')
+ st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v21.csv','text/csv')
  st.caption('Exportaciones de datos geométricos preliminares. No constituyen informe de diseño.')
 
 
 with tabs[7]:
  st.header('⚙️ Motor geotécnico · análisis unificado')
- st.caption('Una única fuente de regiones y etiquetas para el visor, las tablas y la exportación. La comprobación geométrica es diagnóstica y no sustituye el volumen de referencia.')
+ st.caption('La geometría visible, las tablas y la exportación utilizan las mismas etiquetas voxel. Los diagnósticos nunca sustituyen el volumen de referencia.')
  st.warning('GEOMETRÍA PRELIMINAR: los volúmenes proceden de discretización voxel. No se ha validado la persistencia finita, la liberación cinemática ni el factor de seguridad. No usar para dimensionamiento.')
  st.subheader(f"Región seleccionada: B{selected['id']} · {selected['zone']}")
  a,b,c,d=st.columns(4)
@@ -567,6 +567,23 @@ with tabs[7]:
    figcheck.update_layout(height=560,paper_bgcolor='#0b1421',font_color='white',margin=dict(l=0,r=0,t=20,b=0),scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white'),yaxis=dict(title='Y (m)',color='white'),zaxis=dict(title='Z (m)',color='white')))
    st.plotly_chart(figcheck,use_container_width=True)
    st.caption('Superficies voxelizadas de comparación, no geometrías exactas. El zoom general de la aplicación permanece sin cambios.')
+ st.divider()
+ st.subheader('Auditoría de resolución e identidad del bloque')
+ st.caption('Compara el bloque seleccionado entre dos discretizaciones nuevas mediante correspondencia espacial, sin suponer que los identificadores B sean constantes.')
+ if st.button('Comparar resoluciones 48 y 72',key='v21_resolution_go'):
+  with st.spinner('Calculando las regiones y sus correspondencias en dos resoluciones...'):
+   try:
+    audit=compare_block_resolution(selected,xs,ys,zs,labels,W,H,L,az,nplanes,json.dumps(systems,sort_keys=True))
+    if audit['status']=='ok':
+     st.dataframe(pd.DataFrame(audit['history']).round(3),hide_index=True,use_container_width=True)
+     if audit['volume_change_pct'] is not None:
+      st.metric('Variación entre resoluciones',f"{audit['volume_change_pct']:.1f} %")
+     if audit['ambiguous']:
+      st.error('Correspondencia ambigua: hay pérdida de cobertura, mezcla o división entre etiquetas. No se valida el volumen.')
+     else:
+      st.info('Correspondencia espacial favorable, pero todavía no constituye validación geométrica ni cinemática.')
+    else:st.warning('No se pudo completar la auditoría: '+audit['status'])
+   except Exception as exc:st.error(f'Error de auditoría: {type(exc).__name__}: {exc}')
  st.divider()
  if st.button('Ejecutar pruebas geométricas básicas',key='unico_tests'):
   try:
