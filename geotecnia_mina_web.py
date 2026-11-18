@@ -5,8 +5,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
+from motor_geometrico_v17 import reconstruct_local_block
 
-st.set_page_config(page_title='Geotecnia Mina v16.5', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v17.0 alfa', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
 /* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
 html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
@@ -29,7 +30,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v16.5')
+st.title('⛏️ GEOTECNIA MINA  ·  v17.0 alfa')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -224,7 +225,7 @@ if not visible:st.error('No se han identificado regiones con los parámetros act
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
-tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación'])
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17'])
 
 with tabs[0]:
  c1,c2,c3=st.columns([1.2,1,1])
@@ -535,3 +536,30 @@ with tabs[6]:
  st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v161.json','application/json')
  st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v161.csv','text/csv')
  st.caption('Exportaciones de datos geométricos preliminares. No constituyen informe de diseño.')
+
+
+with tabs[7]:
+ st.subheader('Motor v17 alfa · reconstrucción convexa independiente de vóxeles')
+ st.warning('VALIDACIÓN EN DESARROLLO: las caras de discontinuidad se intersectan analíticamente, pero la bóveda se aproxima con un único plano tangente local. No se modela persistencia finita ni liberación cinemática. No utilizar estos volúmenes para dimensionamiento.')
+ st.write(f"Bloque de referencia: **B{selected['id']}**, {selected['zone']} · volumen voxelizado {selected['volume']:.4f} m³")
+ if st.button('Reconstruir celda de planos',key='rebuild_v17'):
+  with st.spinner('Resolviendo semiespacios y envolvente convexa...'):
+   result=reconstruct_local_block(selected,systems,nplanes,W,H,L,az)
+  if result['status']=='ok':
+   vertices=result['vertices'];faces=result['faces']
+   a,b,c=st.columns(3)
+   a.metric('Volumen poliedro local',f"{result['volume']:.4f} m³")
+   b.metric('Volumen voxelizado',f"{selected['volume']:.4f} m³")
+   c.metric('Diferencia relativa',f"{100*(result['volume']/selected['volume']-1):+.1f}%")
+   g=go.Figure()
+   g.add_trace(go.Mesh3d(x=vertices[:,0],y=vertices[:,1],z=vertices[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color='#38d9a9',opacity=.8,flatshading=True,name='Poliedro local'))
+   g.add_trace(go.Scatter3d(x=vertices[:,0],y=vertices[:,1],z=vertices[:,2],mode='markers',marker=dict(color='white',size=4),name='Vértices'))
+   g.update_layout(height=650,paper_bgcolor='#0b1421',font_color='white',scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white'),yaxis=dict(title='Y (m)',color='white'),zaxis=dict(title='Z (m)',color='white')))
+   st.plotly_chart(g,use_container_width=True)
+   st.dataframe(pd.DataFrame(vertices,columns=['X (m)','Y (m)','Z (m)']).round(4),hide_index=True)
+   st.download_button('Exportar vértices CSV',pd.DataFrame(vertices,columns=['X','Y','Z']).to_csv(index=False).encode('utf-8-sig'),f"bloque_B{selected['id']}_vertices_v17.csv",'text/csv')
+   st.info('Una diferencia grande entre volúmenes NO demuestra que uno sea correcto: se están comparando dos aproximaciones geométricas distintas. El siguiente desarrollo debe recortar exactamente la bóveda curva y comprobar la persistencia.')
+  else:
+   st.error(f"No se obtuvo un poliedro tridimensional válido: {result['status']}. Puede ser una región delgada o una celda incompatible con la aproximación tangente.")
+   st.caption(result.get('detail',''))
+ st.markdown('**Próximos criterios de aceptación:** (1) volumen convergente al refinar el perfil curvo, (2) independencia de la resolución voxel, (3) caras identificadas por familia J, (4) persistencia finita, (5) prueba de liberación cinemática. El FS seguirá sin calcularse hasta completar estas comprobaciones.')
