@@ -1,3 +1,11 @@
+"""Motor geométrico único de Geotecnia Mina v19 (experimental).
+
+Todas las rutinas de detección y diagnóstico viven aquí. La unificación
+NO constituye validación de volúmenes, liberación cinemática o FS.
+"""
+import json
+from scipy import ndimage as ndi
+
 """Motor v17.1 experimental: celdas de discontinuidades + integración de bóveda curva.
 La superficie de excavación se evalúa con su ecuación curva exacta; el volumen se
 estima numéricamente mediante muestreo cuasi-Monte Carlo, NO es volumen exacto.
@@ -128,90 +136,6 @@ def reconstruct_curved_block(block, systems, nplanes, W, H, L, az,
             'note':'Volumen numérico de TODA la porción exterior de la celda; no necesariamente la misma componente voxelizada.'}
 
 
-def connected_curved_components(block, systems, nplanes, W, H, L, az,
-                                resolutions=(48, 72, 96), connectivity=1):
-    """Experimental grid-based connected components of rock within a plane cell.
-
-    Identifies the component containing (or nearest to) the selected voxel-block
-    centroid. This is a diagnostic, NOT an exact mesh or a validated wedge volume.
-    """
-    from scipy import ndimage as ndi
-    sample = np.asarray(block['center'], dtype=float)
-    hs, names = cell_halfspaces(systems, nplanes, W, H, L, az, sample)
-    poly = convex_polyhedron(hs)
-    if poly['status'] != 'ok':
-        return poly
-    low = poly['vertices'].min(axis=0)
-    high = poly['vertices'].max(axis=0)
-    span = high - low
-    if np.any(span <= 1e-9):
-        return {'status': 'degenerate_bounds'}
-    results = []
-    last_mask = None
-    last_origin = None
-    last_step = None
-    last_components = []
-    for resolution in resolutions:
-        # Isotropic cells; the longest box dimension has 'resolution' cells.
-        step = float(np.max(span) / int(resolution))
-        shape = np.maximum(3, np.ceil(span / step).astype(int))
-        axes = [low[i] + (np.arange(shape[i]) + .5) * step for i in range(3)]
-        xx, yy, zz = np.meshgrid(*axes, indexing='ij', sparse=True)
-        mask = np.ones(tuple(shape), dtype=bool)
-        # Evaluate each halfspace without constructing a large (N,3) point array.
-        for h in hs:
-            mask &= (h[0]*xx + h[1]*yy + h[2]*zz + h[3] <= 1e-9)
-        r = W / 2.
-        spring = max(0., H-r)
-        void = (np.abs(xx) <= r) & ((zz <= spring) | (xx*xx+(zz-spring)**2 <= r*r))
-        mask &= ~void
-        structure = ndi.generate_binary_structure(3, connectivity)
-        labels, n_components = ndi.label(mask, structure=structure)
-        counts = np.bincount(labels.ravel(), minlength=n_components+1)
-        counts[0] = 0
-        # Associate the selected voxel centroid to one connected component.
-        # If centroid falls on a grid boundary, select nearest occupied cell,
-        # but report that the association was inferred rather than exact.
-        center_index = np.rint((sample - low) / step - .5).astype(int)
-        center_index = np.clip(center_index, 0, shape-1)
-        selected_label = int(labels[tuple(center_index)])
-        association = 'centroid_inside_component'
-        distance = 0.
-        if selected_label == 0:
-            candidates = np.argwhere(labels > 0)
-            if len(candidates):
-                deltas = (candidates + .5) * step + low - sample
-                nearest = int(np.argmin(np.einsum('ij,ij->i', deltas, deltas)))
-                cell = candidates[nearest]
-                distance = float(np.linalg.norm(deltas[nearest]))
-                selected_label = int(labels[tuple(cell)])
-                association = 'nearest_component_inferred'
-            else:
-                association = 'no_rock_cells'
-        component_count = int(counts[selected_label]) if selected_label else 0
-        selected_volume = component_count * step**3
-        total_volume = int(mask.sum()) * step**3
-        components = sorted(({'label':int(i), 'volume_m3':float(counts[i]*step**3),
-                              'cell_count':int(counts[i])} for i in range(1,n_components+1)),
-                            key=lambda item: -item['volume_m3'])
-        results.append({'Resolución':int(resolution), 'Celdas X/Y/Z': '×'.join(map(str,shape)),
-                        'Componentes':int(n_components),
-                        'Volumen componente (m³)':float(selected_volume),
-                        'Volumen total (m³)':float(total_volume),
-                        'Asociación':association,
-                        'Distancia centro (m)':distance})
-        last_mask = (labels == selected_label) if selected_label else np.zeros_like(mask)
-        last_origin = low.copy()
-        last_step = step
-        last_components = components
-    return {'status':'ok', 'progress':results, 'components':last_components,
-            'selected_component_volume':results[-1]['Volumen componente (m³)'],
-            'total_volume':results[-1]['Volumen total (m³)'],
-            'association':results[-1]['Asociación'],
-            'association_distance':results[-1]['Distancia centro (m)'],
-            'component_mask':last_mask, 'grid_origin':last_origin,
-            'grid_step':last_step, 'halfspace_names':names,
-            'warning':'Discretización experimental; las componentes pueden fusionarse o desaparecer al cambiar resolución.'}
 def connected_curved_components(block, systems, nplanes, W, H, L, az,
                                 resolutions=(48, 72, 96), connectivity=1):
     """Experimental grid-based connected components of rock within a plane cell.
@@ -514,3 +438,147 @@ def diagnose_independent_block(block, blocks, original_labels, xs, ys, zs,
     return {'status':'ok','progress':history,'convergence_pct':convergence,
             'ambiguous':ambiguous,'halfspace_names':names,**final,
             'validated':False,'method':'Segmentación espacial sin etiquetas; comparación posterior con etiquetas originales'}
+
+"""Motor v18: diagnóstico reproducible de celdas y conectividad.
+No calcula cuñas cinemáticamente liberables ni factores de seguridad.
+"""
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.spatial import ConvexHull
+from scipy.optimize import linprog
+
+
+def normal(dd, dip, az=0):
+    a,b=np.deg2rad([(dd-az)%360,dip])
+    return np.array([np.sin(a)*np.sin(b),np.cos(a)*np.sin(b),np.cos(b)])
+
+
+def planes(systems, nplanes, H, az):
+    out=[]
+    for j,s in enumerate(systems,1):
+        n=normal(s['dd'],s['dip'],az)
+        base=n@np.array([s['xx'],s['yy'],H])
+        for k in range(nplanes):
+            level=base+(k-(nplanes-1)/2)*s['spacing']
+            out.append((f'J{j}.{k+1}',n,float(level)))
+    return out
+
+
+def signature_at(p, plane_list):
+    return tuple(int(np.dot(n,p)>=d) for _,n,d in plane_list)
+
+
+def rock_mask(X,Z,W,H):
+    r=W/2; spring=max(0,H-r)
+    void=(np.abs(X)<=r)&((Z<=spring)|((Z>spring)&(X*X+(Z-spring)**2<=r*r)))
+    return ~void
+
+
+def grid_diagnostic(block, labels, xs,ys,zs, systems,nplanes,W,H,L,az, resolution=80):
+    """Reconstructs the plane cell containing the selected voxel block.
+    Explicitly reports when the cell contains multiple original labels.
+    Uses same physical coordinates for all comparisons, no centroid-only matching.
+    """
+    pl=planes(systems,nplanes,H,az)
+    ident=int(block['id'])
+    idx=np.argwhere(labels==ident)
+    if not len(idx):return {'status':'missing'}
+    # The signature must be identical across a valid original region.
+    samples=idx[np.linspace(0,len(idx)-1,min(len(idx),60),dtype=int)]
+    sigs={signature_at(np.array([xs[i],ys[j],zs[k]]),pl) for i,j,k in samples}
+    if len(sigs)!=1:
+        return {'status':'inconsistent_original_signatures','signatures':len(sigs)}
+    sig=next(iter(sigs))
+    # Limit the integration box to the original region plus a conservative margin.
+    # This is a diagnostic local window, NOT the exact complete cell.
+    lo=idx.min(axis=0);hi=idx.max(axis=0)
+    span0=np.array([xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0]])
+    margin=np.maximum(3*span0,0.75)
+    domainlo=np.array([xs[0],ys[0],zs[0]])
+    domainhi=np.array([xs[-1],ys[-1],zs[-1]])
+    low=np.maximum(domainlo,np.array([xs[lo[0]],ys[lo[1]],zs[lo[2]]])-margin)
+    high=np.minimum(domainhi,np.array([xs[hi[0]],ys[hi[1]],zs[hi[2]]])+margin)
+    step=float(max(high-low)/int(resolution))
+    dims=np.maximum(3,np.ceil((high-low)/step).astype(int))
+    ax=[low[i]+(np.arange(dims[i])+.5)*step for i in range(3)]
+    X,Y,Z=np.meshgrid(*ax,indexing='ij',sparse=True)
+    mask=rock_mask(X,Z,W,H)
+    mask=np.broadcast_to(mask,tuple(dims)).copy()
+    for bit,(_,n,d) in zip(sig,pl):
+        signed=n[0]*X+n[1]*Y+n[2]*Z-d
+        mask &= signed>=-1e-10 if bit else signed < -1e-10
+    cc,num=ndi.label(mask,structure=ndi.generate_binary_structure(3,1))
+    # Compare every candidate component against all original block labels on the same grid.
+    ii=np.rint((ax[0]-xs[0])/span0[0]).astype(int)
+    jj=np.rint((ax[1]-ys[0])/span0[1]).astype(int)
+    kk=np.rint((ax[2]-zs[0])/span0[2]).astype(int)
+    validx=(ii>=0)&(ii<len(xs));validy=(jj>=0)&(jj<len(ys));validz=(kk>=0)&(kk<len(zs))
+    original=np.zeros(tuple(dims),dtype=np.int32)
+    original[np.ix_(validx,validy,validz)]=labels[np.ix_(np.clip(ii[validx],0,len(xs)-1),np.clip(jj[validy],0,len(ys)-1),np.clip(kk[validz],0,len(zs)-1))]
+    counts=[]
+    for c in range(1,num+1):
+        component=cc==c
+        if component.sum()<2:continue
+        unique,numbers=np.unique(original[component],return_counts=True)
+        matched={int(u):int(v) for u,v in zip(unique,numbers) if u>0 and v>0}
+        overlap=matched.get(ident,0)
+        counts.append({'component':c,'volume_m3':float(component.sum()*step**3),
+                       'overlap_selected_m3':float(overlap*step**3),
+                       'purity_pct':100*overlap/max(1,int(component.sum())),
+                       'other_blocks':', '.join('B'+str(u) for u in matched if u!=ident),
+                       'mask':component})
+    if not counts:return {'status':'no_components'}
+    counts.sort(key=lambda d:d['overlap_selected_m3'],reverse=True)
+    chosen=counts[0]
+    original_selected=original==ident
+    intersection=chosen['mask']&original_selected
+    union=chosen['mask']|original_selected
+    coverage=100*intersection.sum()/max(1,original_selected.sum())
+    iou=100*intersection.sum()/max(1,union.sum())
+    return {'status':'ok','signature':sig,'planes':pl,'component_count':len(counts),
+            'components':counts,'chosen':chosen,'coverage_pct':coverage,'iou_pct':iou,
+            'original_resampled_m3':float(original_selected.sum()*step**3),
+            'selected_voxel_m3':float(block['volume']),'origin':low,'step':step,
+            'grid':tuple(dims),'original_mask':original_selected,'intersection_mask':intersection,
+            'window_touches':bool(np.any(chosen['mask'][0]) or np.any(chosen['mask'][-1]) or np.any(chosen['mask'][:,0]) or np.any(chosen['mask'][:,-1]) or np.any(chosen['mask'][:,:,0]) or np.any(chosen['mask'][:,:,-1]))}
+
+
+def synthetic_tests():
+    """Simple numerical invariants independent of the application scenario."""
+    n=normal(0,90,0)
+    assert np.allclose(n,[0,1,0],atol=1e-12)
+    a=np.array([-.5,.5]);z=np.array([1.,4.])
+    assert not rock_mask(a[0],z[0],5.8,5.8)
+    assert rock_mask(4.,3.,5.8,5.8)
+    assert rock_mask(0.,6.,5.8,5.8)
+    return True
+
+def compute_regions(W,H,L,az,res,nplanes,systems_json):
+ systems=json.loads(systems_json);r=W/2;ss=max(0,H-r);margin=max(2.,W*.5)
+ nx=res;ny=max(30,min(105,round(res*L/(W+2*margin))));nz=max(35,min(85,round(res*(H+margin)/(W+2*margin))))
+ xs=np.linspace(-r-margin,r+margin,nx);ys=np.linspace(0,L,ny);zs=np.linspace(0,H+margin,nz)
+ X,Y,Z=np.meshgrid(xs,ys,zs,indexing='ij');tunnel=(abs(X)<=r)&((Z<=ss)|((Z>ss)&(X*X+(Z-ss)**2<=r*r)))
+ rock=~tunnel;signature=np.zeros(rock.shape,dtype=np.uint32);bit=0
+ for s in systems:
+  n=normal(s['dd'],s['dip'],az);base=np.dot(n,[s['xx'],s['yy'],H]);signed=n[0]*X+n[1]*Y+n[2]*Z-base
+  for k in range(nplanes):
+   offset=(k-(nplanes-1)/2)*s['spacing'];signature|=((signed>=offset).astype(np.uint32)<<bit);bit+=1
+ structure=ndi.generate_binary_structure(3,1);adjacent=rock&ndi.binary_dilation(tunnel,structure=structure)
+ labels=np.zeros(rock.shape,dtype=np.int16);blocks=[];ident=0
+ voxel=np.prod([xs[1]-xs[0],ys[1]-ys[0],zs[1]-zs[0]])
+ for sig in np.unique(signature[adjacent]):
+  region_labels,_=ndi.label(rock&(signature==sig),structure)
+  for comp in np.unique(region_labels[adjacent]):
+   if comp==0:continue
+   reg=region_labels==comp;count=int(reg.sum())
+   if count<5:continue
+   touching=reg&adjacent;roof=int((touching&(Z>ss)).sum());left=int((touching&(Z<=ss)&(X<0)).sum());right=int((touching&(Z<=ss)&(X>=0)).sum())
+   zone=['Bóveda','Hastial izq.','Hastial der.'][np.argmax([roof,left,right])]
+   opened=bool(reg[0].any() or reg[-1].any() or reg[:,0].any() or reg[:,-1].any() or reg[:,:,0].any() or reg[:,:,-1].any())
+   ident+=1;labels[reg]=ident
+   coords=np.argwhere(reg);cc=np.argwhere(touching)
+   c=np.mean(coords,axis=0);tc=np.mean(cc,axis=0)
+   center=[float(xs[0]+c[0]*(xs[1]-xs[0])),float(ys[0]+c[1]*(ys[1]-ys[0])),float(zs[0]+c[2]*(zs[1]-zs[0]))]
+   contact=[float(xs[0]+tc[0]*(xs[1]-xs[0])),float(ys[0]+tc[1]*(ys[1]-ys[0])),float(zs[0]+tc[2]*(zs[1]-zs[0]))]
+   blocks.append(dict(id=ident,zone=zone,volume=count*voxel,open=opened,center=center,contact=contact))
+ return xs,ys,zs,labels,blocks
