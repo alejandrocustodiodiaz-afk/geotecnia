@@ -430,3 +430,87 @@ def reconstruct_labeled_block(block, original_labels, xs, ys, zs, systems,
             'validated':False,
             'method':'Subdivisión de etiquetas originales y reevaluación de límites geométricos',
             'warning':'Volumen experimental condicionado a la segmentación original; no equivale a reconstrucción exacta independiente.'}
+
+
+def diagnose_independent_block(block, blocks, original_labels, xs, ys, zs,
+                               systems, nplanes, W, H, L, az,
+                               resolutions=(36, 54, 72)):
+    """Independent plane-cell segmentation with spatial label correspondence.
+
+    The reconstructed geometry does not use original labels as constraints.
+    Original labels are sampled ONLY for comparison and visual diagnostics.
+    This is still a discretized, infinite-persistence, non-kinematic model.
+    """
+    import numpy as np
+    from scipy import ndimage as ndi
+    hs, names = cell_halfspaces(systems, nplanes, W, H, L, az, block['center'])
+    poly = convex_polyhedron(hs)
+    if poly.get('status') != 'ok':
+        return poly
+    low = np.asarray(poly['vertices']).min(axis=0)
+    high = np.asarray(poly['vertices']).max(axis=0)
+    span = high-low
+    if np.min(span) <= 1.e-10:
+        return {'status': 'degenerate_bounds'}
+    history=[]
+    final=None
+    source_axes=[np.asarray(a,float) for a in (xs,ys,zs)]
+    for resolution in resolutions:
+        step=float(np.max(span)/int(resolution))
+        shape=np.maximum(3,np.ceil(span/step).astype(int))
+        if int(np.prod(shape)) > 2500000:
+            return {'status':'too_large'}
+        axes=[low[d]+(np.arange(shape[d])+.5)*step for d in range(3)]
+        xx,yy,zz=np.meshgrid(*axes,indexing='ij',sparse=True)
+        mask=np.ones(tuple(shape),dtype=bool)
+        for h in hs:
+            mask &= h[0]*xx+h[1]*yy+h[2]*zz+h[3] <= 1.e-9
+        r=W/2.; spring=max(0.,H-r)
+        mask &= ~((np.abs(xx)<=r)&((zz<=spring)|(xx*xx+(zz-spring)**2<=r*r)))
+        cc,ncomp=ndi.label(mask,ndi.generate_binary_structure(3,1))
+        # Original labels are NOT used to construct the independent components.
+        idx=[]; valid=[]
+        for a,src in zip(axes,source_axes):
+            f=(a-src[0])/(src[1]-src[0])
+            idx.append(np.clip(np.rint(f).astype(int),0,len(src)-1))
+            valid.append((f>=-.5)&(f<=len(src)-.5))
+        original=original_labels[np.ix_(*idx)].copy()
+        in_domain=(valid[0][:,None,None]&valid[1][None,:,None]&valid[2][None,None,:])
+        original[~in_domain]=0
+        selected_original=(original==int(block['id']))
+        counts=np.bincount(cc.ravel(),minlength=ncomp+1)
+        overlaps=np.bincount(cc[selected_original],minlength=ncomp+1)
+        overlaps[0]=0
+        chosen=int(np.argmax(overlaps)) if ncomp else 0
+        matching=int(overlaps[chosen]) if chosen else 0
+        candidate=(cc==chosen)&mask if chosen else np.zeros_like(mask)
+        selected_inside=selected_original&mask
+        original_count=int(selected_original.sum())
+        candidate_count=int(counts[chosen]) if chosen else 0
+        coverage=100*matching/max(original_count,1)
+        purity=100*matching/max(candidate_count,1)
+        other_ids=np.unique(original[candidate])
+        collisions=[]
+        for bid in other_ids:
+            if bid<=0 or bid==block['id']:continue
+            ct=int(np.count_nonzero(candidate&(original==bid)))
+            if ct:collisions.append({'Bloque':f'B{int(bid)}','Solape (m³)':ct*step**3,
+                                     'Porcentaje componente (%)':100*ct/max(candidate_count,1)})
+        history.append({'Resolución':int(resolution),'Componentes':int(ncomp),
+                        'Volumen candidato (m³)':candidate_count*step**3,
+                        'Volumen B original remuestreado (m³)':original_count*step**3,
+                        'Cobertura B (%)':coverage,'Pureza componente (%)':purity,
+                        'Otros bloques en componente':len(collisions)})
+        final={'candidate_mask':candidate,'original_mask':selected_original,
+               'original_inside_mask':selected_inside,'origin':low.copy(),'step':step,
+               'collisions':collisions,'component_id':chosen,
+               'component_count':ncomp,'matching_cells':matching,
+               'coverage_pct':coverage,'purity_pct':purity,
+               'candidate_volume':candidate_count*step**3,
+               'original_resampled_volume':original_count*step**3}
+    vols=[row['Volumen candidato (m³)'] for row in history]
+    convergence=100*abs(vols[-1]-vols[-2])/max(vols[-1],1.e-12) if len(vols)>1 else None
+    ambiguous=bool(final['collisions']) or final['purity_pct']<90 or final['coverage_pct']<90
+    return {'status':'ok','progress':history,'convergence_pct':convergence,
+            'ambiguous':ambiguous,'halfspace_names':names,**final,
+            'validated':False,'method':'Segmentación espacial sin etiquetas; comparación posterior con etiquetas originales'}
