@@ -5,10 +5,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_geometrico_v17_3 import reconstruct_curved_block, connected_curved_components, compare_spatial_components
+from motor_geometrico_v17_4 import reconstruct_curved_block, connected_curved_components, compare_spatial_components, reconstruct_labeled_block
 
-st.set_page_config(page_title='Geotecnia Mina v17.3 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Geotecnia Mina v17.4 experimental', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
+[data-testid="stAlert"] p,[data-testid="stAlert"] span,[data-testid="stAlert"] div{color:#182337!important}
+.stButton button{color:#152235!important;font-weight:650!important}
+
 /* Tema oscuro consistente: texto de widgets, valores, métricas y pestañas */
 html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{background:#0b1421!important;color:#f1f7ff!important}
 [data-testid="stSidebar"]{background:#101d2f!important}
@@ -30,7 +33,7 @@ html,body,.stApp,[data-testid="stAppViewContainer"],[data-testid="stSidebar"]{ba
 .block-container{padding-top:1rem;max-width:1750px}
 </style>""",unsafe_allow_html=True)
 COL=['#36d6bb','#68a8ff','#eeb65d','#d58bf0','#ef7b88','#b5d66b']
-st.title('⛏️ GEOTECNIA MINA  ·  v17.3 experimental')
+st.title('⛏️ GEOTECNIA MINA  ·  v17.4 experimental')
 st.caption('Galerías y cámaras · visualizador 3D · estereograma Schmidt/Wulff · Potvin · proyectos · sensibilidad')
 st.warning('PROTOTIPO GEOMÉTRICO. Las regiones se detectan mediante discretización; las superficies 3D de regiones cerradas se reconstruyen a partir de ecuaciones analíticas de planos y herradura. La persistencia no recorta los planos. Bloque cerrado ≠ cuña liberable. No se calcula FS validado ni se dimensiona sostenimiento. No usar para decisiones de seguridad.')
 
@@ -225,7 +228,7 @@ if not visible:st.error('No se han identificado regiones con los parámetros act
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
-tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.3'])
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.4'])
 
 with tabs[0]:
  c1,c2,c3=st.columns([1.2,1,1])
@@ -539,10 +542,40 @@ with tabs[6]:
 
 
 with tabs[7]:
- st.subheader('Motor v17.3 · correspondencia espacial de bloques')
+ st.subheader('Motor v17.4 · reconstrucción individual condicionada')
  st.warning('MOTOR EXPERIMENTAL: la excavación se evalúa con su perfil curvo, pero el volumen se ESTIMA numéricamente. Una celda de planos puede contener varias componentes. No hay persistencia finita, prueba cinemática ni factor de seguridad. NO usar para dimensionamiento.')
  st.write(f"Bloque de referencia: **B{selected['id']}**, {selected['zone']} · volumen voxelizado {selected['volume']:.4f} m³")
 
+ st.markdown('### Reconstrucción individual por etiqueta original (v17.4)')
+ st.caption('Cada bloque B mantiene su propia etiqueta. Se subdividen sus vóxeles y se comprueban nuevamente los planos y la bóveda curva. Esto evita asignar a B15 el volumen completo de la componente compartida, pero depende de la segmentación voxelizada original.')
+ if st.button('Reconstruir volumen individual del bloque',key='v174_individual'):
+  with st.spinner('Refinando el bloque seleccionado sin fusionarlo con otras etiquetas...'):
+   ind=reconstruct_labeled_block(selected,labels,xs,ys,zs,systems,nplanes,W,H,L,az,factors=(1,2,3))
+  if ind['status']=='ok':
+   ia,ib,ic=st.columns(3)
+   ia.metric('Volumen individual estimado (no validado)',f"{ind['individual_volume']:.4f} m³")
+   ib.metric('Volumen voxelizado original',f"{ind['original_volume']:.4f} m³")
+   ic.metric('Diferencia por refinamiento',f"{ind['difference_pct']:+.1f} %")
+   st.dataframe(pd.DataFrame(ind['progress']).round(4),hide_index=True,use_container_width=True)
+   st.warning('El resultado conserva la identidad del bloque original, pero NO constituye una reconstrucción exacta ni demuestra que el bloque sea cinemáticamente desprendible. Si la segmentación inicial es incorrecta, el resultado también lo será.')
+   if ind['progress'][-1]['Componentes internas']>1:
+    st.error('La etiqueta seleccionada contiene varias componentes después del refinamiento. Revisar la conectividad y la discretización.')
+   try:
+    m=ind['mask']; pad=np.pad(m.astype(np.uint8),1)
+    if m.any():
+     v,f,_,_=marching_cubes(pad,level=.5,spacing=tuple(ind['spacing']))
+     v+=ind['origin']-ind['spacing']
+     fig=go.Figure(go.Mesh3d(x=v[:,0],y=v[:,1],z=v[:,2],i=f[:,0],j=f[:,1],k=f[:,2],
+                  color='#40c7a3',opacity=.96,flatshading=True,name=f"B{selected['id']}"))
+     fig.update_layout(height=540,paper_bgcolor='#0b1421',font_color='white',
+        scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white'),
+        yaxis=dict(title='Y (m)',color='white'),zaxis=dict(title='Z (m)',color='white')))
+     st.plotly_chart(fig,use_container_width=True)
+   except (ValueError,RuntimeError) as exc:
+    st.warning(f'No se pudo representar el bloque: {exc}')
+  else:
+   st.error(f"Reconstrucción no disponible: {ind['status']}")
+ st.divider()
  st.markdown('### Separación de componentes conectadas (nuevo)')
  st.caption('Se reconstruyen las componentes y se compara su ocupación espacial con las etiquetas de los bloques voxelizados originales. Un centroide dentro de una componente NO demuestra correspondencia.')
  resolutions=st.selectbox('Precisión del análisis de componentes', ['Rápida (36/54/72)', 'Alta (48/72/96)'],index=0,key='v172_resolution')
