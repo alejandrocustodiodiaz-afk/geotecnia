@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import ndimage as ndi
 from skimage.measure import marching_cubes, find_contours
-from motor_geometrico_v17 import reconstruct_local_block
+from motor_geometrico_v17_1 import reconstruct_curved_block
 
 st.set_page_config(page_title='Geotecnia Mina v17.0 alfa', page_icon='⛏️', layout='wide', initial_sidebar_state='expanded')
 st.markdown("""<style>
@@ -225,7 +225,7 @@ if not visible:st.error('No se han identificado regiones con los parámetros act
 
 m1,m2,m3,m4=st.columns(4)
 m1.metric('Regiones en contacto',len(visible));m2.metric('Cerradas en dominio',len(closed));m3.metric('Abiertas al borde',len(visible)-len(closed));m4.metric('FS validado','No calculado')
-tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17'])
+tabs=st.tabs(['🧊 Cuñas 3D','🧭 Estereograma y mediciones','📏 Cortes 2D','🧱 Sostenimiento','🏗️ Cámaras · Potvin','📈 Sensibilidad','📥 Exportación','🧪 Motor geométrico v17.1'])
 
 with tabs[0]:
  c1,c2,c3=st.columns([1.2,1,1])
@@ -532,34 +532,50 @@ with tabs[5]:
  st.info('No se reproduce el FS simplificado de GeologgIA: la estabilidad requiere comprobar cinemática, fuerzas y sostenimiento efectivo.')
 
 with tabs[6]:
- data={'version':'16.2','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
+ data={'version':'17.1 experimental','geometria':{'W':W,'H':H,'L':L,'azimut':az,'gamma':gamma},'sistemas':systems,'sostenimiento':{'tipo':typ,'pernos_m':boltlen,'separacion_m':boltspace,'gunita_m':shot,'cables_m':cablelen,'malla':mesh},'bloques':visible,'mediciones':rows,'advertencia':'Prototipo sin FS ni verificación cinemática'}
  st.download_button('Guardar proyecto / resultados JSON',json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8'),'geotecnia_mina_v161.json','application/json')
  st.download_button('Descargar bloques CSV',pd.DataFrame(visible).to_csv(index=False).encode('utf-8-sig'),'bloques_v161.csv','text/csv')
  st.caption('Exportaciones de datos geométricos preliminares. No constituyen informe de diseño.')
 
 
 with tabs[7]:
- st.subheader('Motor v17 alfa · reconstrucción convexa independiente de vóxeles')
- st.warning('VALIDACIÓN EN DESARROLLO: las caras de discontinuidad se intersectan analíticamente, pero la bóveda se aproxima con un único plano tangente local. No se modela persistencia finita ni liberación cinemática. No utilizar estos volúmenes para dimensionamiento.')
+ st.subheader('Motor v17.1 · comprobación con bóveda curva')
+ st.warning('MOTOR EXPERIMENTAL: la excavación se evalúa con su perfil curvo, pero el volumen se ESTIMA numéricamente. Una celda de planos puede contener varias componentes. No hay persistencia finita, prueba cinemática ni factor de seguridad. NO usar para dimensionamiento.')
  st.write(f"Bloque de referencia: **B{selected['id']}**, {selected['zone']} · volumen voxelizado {selected['volume']:.4f} m³")
- if st.button('Reconstruir celda de planos',key='rebuild_v17'):
-  with st.spinner('Resolviendo semiespacios y envolvente convexa...'):
-   result=reconstruct_local_block(selected,systems,nplanes,W,H,L,az)
+ c1,c2=st.columns(2)
+ with c1:
+  power=st.select_slider('Precisión de muestreo (potencia de 2)',options=[12,13,14,15,16,17],value=16,key='v171_power')
+ with c2:
+  repeats=st.select_slider('Repeticiones independientes',options=[2,4,6,8],value=4,key='v171_repeats')
+ st.caption('El volumen estimado corresponde a toda la porción de la celda convexa que queda fuera de la excavación, no necesariamente a una única región conectada B.')
+ if st.button('Reconstruir y comparar con bóveda curva',key='rebuild_v171'):
+  with st.spinner('Reconstruyendo celda y estimando volumen con muestreo Sobol...'):
+   result=reconstruct_curved_block(selected,systems,nplanes,W,H,L,az,powers=(max(10,power-4),max(11,power-2),power),repeats=repeats)
   if result['status']=='ok':
    vertices=result['vertices'];faces=result['faces']
-   a,b,c=st.columns(3)
-   a.metric('Volumen poliedro local',f"{result['volume']:.4f} m³")
-   b.metric('Volumen voxelizado',f"{selected['volume']:.4f} m³")
-   c.metric('Diferencia relativa',f"{100*(result['volume']/selected['volume']-1):+.1f}%")
+   a,b,c,d=st.columns(4)
+   a.metric('Celda convexa completa',f"{result['volume_convex_cell']:.4f} m³")
+   b.metric('Exterior a bóveda curva (estimado)',f"{result['volume_curved_estimate']:.4f} m³")
+   c.metric('Volumen voxelizado',f"{selected['volume']:.4f} m³")
+   d.metric('Diferencia estimada',f"{100*result['relative_difference']:+.1f}%")
+   st.caption(f"Dispersión entre {repeats} réplicas: {result['replicate_sd']:.5f} m³. Es una medida de variabilidad del muestreo, no de error geométrico total.")
+   if abs(result['relative_difference'])>.2:
+    st.error('DISCREPANCIA IMPORTANTE: la celda y la región voxelizada podrían no representar la misma componente, o el modelo voxelizado podría ser impreciso. No aceptar este volumen como validado.')
+   else:
+    st.info('Concordancia numérica preliminar. No demuestra identidad geométrica, continuidad ni liberación de la cuña.')
+   st.markdown('**Convergencia del volumen numérico**')
+   st.dataframe(pd.DataFrame(result['progress']).round(5),hide_index=True,use_container_width=True)
+   st.markdown('**Discontinuidades y límites de la celda**')
+   st.dataframe(pd.DataFrame(result['faces_diagnostic']),hide_index=True,use_container_width=True)
+   st.caption('Las caras mostradas a continuación corresponden a la celda convexa completa ANTES de recortarla con la bóveda curva. No son la malla final de la cuña.')
    g=go.Figure()
-   g.add_trace(go.Mesh3d(x=vertices[:,0],y=vertices[:,1],z=vertices[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color='#38d9a9',opacity=.8,flatshading=True,name='Poliedro local'))
+   g.add_trace(go.Mesh3d(x=vertices[:,0],y=vertices[:,1],z=vertices[:,2],i=faces[:,0],j=faces[:,1],k=faces[:,2],color='#38d9a9',opacity=.45,flatshading=True,name='Celda completa'))
    g.add_trace(go.Scatter3d(x=vertices[:,0],y=vertices[:,1],z=vertices[:,2],mode='markers',marker=dict(color='white',size=4),name='Vértices'))
-   g.update_layout(height=650,paper_bgcolor='#0b1421',font_color='white',scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white'),yaxis=dict(title='Y (m)',color='white'),zaxis=dict(title='Z (m)',color='white')))
+   g.update_layout(height=620,paper_bgcolor='#0b1421',font_color='white',scene=dict(bgcolor='#0b1421',aspectmode='data',xaxis=dict(title='X (m)',color='white',nticks=4),yaxis=dict(title='Y (m)',color='white',nticks=4),zaxis=dict(title='Z (m)',color='white',nticks=4)))
    st.plotly_chart(g,use_container_width=True)
-   st.dataframe(pd.DataFrame(vertices,columns=['X (m)','Y (m)','Z (m)']).round(4),hide_index=True)
-   st.download_button('Exportar vértices CSV',pd.DataFrame(vertices,columns=['X','Y','Z']).to_csv(index=False).encode('utf-8-sig'),f"bloque_B{selected['id']}_vertices_v17.csv",'text/csv')
-   st.info('Una diferencia grande entre volúmenes NO demuestra que uno sea correcto: se están comparando dos aproximaciones geométricas distintas. El siguiente desarrollo debe recortar exactamente la bóveda curva y comprobar la persistencia.')
+   df_out=pd.DataFrame(result['progress'])
+   st.download_button('Exportar convergencia CSV',df_out.to_csv(index=False).encode('utf-8-sig'),f"B{selected['id']}_convergencia_v17_1.csv",'text/csv')
+   st.info('Pendiente: identificar componentes conectadas, persistencia finita y construir la malla exacta del recorte curvo. FS no calculado.')
   else:
-   st.error(f"No se obtuvo un poliedro tridimensional válido: {result['status']}. Puede ser una región delgada o una celda incompatible con la aproximación tangente.")
+   st.error(f"No se obtuvo una celda válida: {result['status']}")
    st.caption(result.get('detail',''))
- st.markdown('**Próximos criterios de aceptación:** (1) volumen convergente al refinar el perfil curvo, (2) independencia de la resolución voxel, (3) caras identificadas por familia J, (4) persistencia finita, (5) prueba de liberación cinemática. El FS seguirá sin calcularse hasta completar estas comprobaciones.')
